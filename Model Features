@@ -613,3 +613,94 @@ Next Steps for Phase 3 (Modeling):
 3. Apply cross-correlation or DTW for optimal TVT alignment
 4. Build ensemble model combining structural and GR-based approaches
 """)
+import pandas as pd
+import numpy as np
+from sklearn.metrics import r2_score, mean_absolute_error
+
+print("=== MASTER INTERPOLATION & QC (SINGLE FILE RECOVERY) ===\n")
+
+# 1. Load the original dataset
+file_path = '/content/train_horizontal.parquet'
+try:
+    df_hz = pd.read_parquet(file_path)
+    print(f"✅ Successfully loaded '{file_path}'")
+except FileNotFoundError:
+    print(f"❌ ERROR: File not found! Please ensure the Kaggle file is uploaded.")
+    raise SystemExit
+
+# 2. Map ALL geological zones (Including the SHALLOW_OVERBURDEN we found yesterday)
+print("Mapping geological zones...")
+conditions = [
+    (df_hz['Z'] > df_hz['ANCC']),
+    (df_hz['Z'] <= df_hz['ANCC']) & (df_hz['Z'] > df_hz['ASTNU']),
+    (df_hz['Z'] <= df_hz['ASTNU']) & (df_hz['Z'] > df_hz['ASTNL']),
+    (df_hz['Z'] <= df_hz['ASTNL']) & (df_hz['Z'] > df_hz['EGFDU']),
+    (df_hz['Z'] <= df_hz['EGFDU']) & (df_hz['Z'] > df_hz['EGFDL']),
+    (df_hz['Z'] <= df_hz['EGFDL']) & (df_hz['Z'] > df_hz['BUDA']),
+    (df_hz['Z'] <= df_hz['BUDA'])
+]
+formations = ['SHALLOW_OVERBURDEN', 'ANCC', 'ASTNU', 'ASTNL', 'EGFDU', 'EGFDL', 'BUDA']
+df_hz['Zone'] = np.select(conditions, formations, default='ERROR')
+
+print("\nRunning Strict Well-by-Well Interpolation & Generating QC Scores...\n")
+print(f"{'Zone'.ljust(20)} | {'QC R^2 Score'.ljust(15)} | {'Avg Error (MAE)'.ljust(18)} | {'Rows Healed'}")
+print("-" * 80)
+
+# 3. The QC & Interpolation Loop
+for zone in formations:
+    zone_mask = df_hz['Zone'] == zone
+    df_zone = df_hz[zone_mask].copy()
+
+    total_missing = df_zone['GR'].isna().sum()
+
+    if len(df_zone) < 100:
+        continue
+
+    # --- QC STEP: ARTIFICIAL MASKING ---
+    known_idx = df_zone[df_zone['GR'].notna()].index
+    hide_count = int(len(known_idx) * 0.10) # Hide 10%
+
+    if hide_count > 0:
+        test_idx = np.random.choice(known_idx, size=hide_count, replace=False)
+        df_zone['GR_test'] = df_zone['GR']
+        df_zone.loc[test_idx, 'GR_test'] = np.nan
+
+        # Test interpolation
+        df_zone['GR_test'] = df_zone.groupby('WELL_ID')['GR_test'].transform(
+            lambda x: x.interpolate(method='linear', limit_direction='both')
+        )
+
+        valid_test = df_zone.loc[test_idx].dropna(subset=['GR_test', 'GR'])
+        if len(valid_test) > 0:
+            y_true = valid_test['GR']
+            y_pred = valid_test['GR_test']
+            r2 = r2_score(y_true, y_pred)
+            mae = mean_absolute_error(y_true, y_pred)
+        else:
+            r2, mae = float('nan'), float('nan')
+    else:
+        r2, mae = float('nan'), float('nan')
+
+    # --- REAL IMPUTATION STEP ---
+    if total_missing > 0:
+        df_hz.loc[zone_mask, 'GR'] = df_hz[zone_mask].groupby('WELL_ID')['GR'].transform(
+            lambda x: x.interpolate(method='linear', limit_direction='both')
+        )
+
+    # Print the QC Results
+    r2_text = f"{r2:5.3f}" if not np.isnan(r2) else "N/A"
+    mae_text = f"{mae:5.2f} API" if not np.isnan(mae) else "N/A"
+    print(f"{zone.ljust(20)} | R^2 = {r2_text}".ljust(37) + f"| +/- {mae_text}".ljust(21) + f"| {total_missing:,}")
+
+# 4. The Wilson Patch (Healing the 3 blind Overburden wells)
+remaining_nans = df_hz['GR'].isna().sum()
+if remaining_nans > 0:
+    print(f"\n⚠️ Applying Wilson Patch: Filling {remaining_nans} un-bridgeable rows with the Shallow Overburden median.")
+    shallow_rock = df_hz[df_hz['Z'] > df_hz['ANCC']]
+    df_hz['GR'] = df_hz['GR'].fillna(shallow_rock['GR'].median())
+
+# 5. Clean up and Save STRICTLY to the original file
+df_hz = df_hz.drop(columns=['Zone'])
+df_hz.to_parquet(file_path)
+
+print(f"\n✅ SUCCESS: Missing GR is {df_hz['GR'].isna().sum()}. Data saved exclusively to '{file_path}'.")
