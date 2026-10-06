@@ -1,0 +1,615 @@
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.ndimage import uniform_filter1d
+from scipy.signal import correlate
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 70)
+print("PHASE 2: FEATURE ENGINEERING")
+print("=" * 70)
+
+# -----------------------------------------------------------------------------
+# STEP 2.1: Load Data
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.1: LOADING DATA")
+print("=" * 70)
+
+# Load all datasets
+train_horizontal = pd.read_parquet('train_horizontal.parquet')
+train_typewell = pd.read_parquet('train_typewell.parquet')
+test_horizontal = pd.read_parquet('test_horizontal.parquet')
+test_typewell = pd.read_parquet('test_typewell.parquet')
+
+print(f"\n✓ Train Horizontal: {train_horizontal.shape[0]:,} rows, {train_horizontal['WELL_ID'].nunique()} wells")
+print(f"✓ Train Typewell: {train_typewell.shape[0]:,} rows, {train_typewell['WELL_ID'].nunique()} wells")
+print(f"✓ Test Horizontal: {test_horizontal.shape[0]:,} rows, {test_horizontal['WELL_ID'].nunique()} wells")
+print(f"✓ Test Typewell: {test_typewell.shape[0]:,} rows, {test_typewell['WELL_ID'].nunique()} wells")
+
+# Identify test well IDs
+test_well_ids = test_horizontal['WELL_ID'].unique().tolist()
+print(f"\nTest Well IDs: {test_well_ids}")
+
+# -----------------------------------------------------------------------------
+# STEP 2.2: GR Imputation Function
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.2: GR IMPUTATION STRATEGY")
+print("=" * 70)
+
+def impute_gr(df, well_col='WELL_ID', gr_col='GR', md_col='MD', method='linear'):
+    """
+    Impute missing GR values using interpolation
+
+    Parameters:
+    - df: DataFrame with GR data
+    - method: 'linear', 'nearest', or 'rolling'
+
+    Returns:
+    - DataFrame with imputed GR
+    """
+    df = df.copy()
+    df = df.sort_values([well_col, md_col]).reset_index(drop=True)
+
+    imputed_count = 0
+    total_missing = df[gr_col].isna().sum()
+
+    for well_id in df[well_col].unique():
+        mask = df[well_col] == well_id
+        well_data = df.loc[mask, [md_col, gr_col]].copy()
+
+        if well_data[gr_col].isna().any() and well_data[gr_col].notna().sum() >= 2:
+            # Get valid points for interpolation
+            valid_mask = well_data[gr_col].notna()
+
+            if valid_mask.sum() >= 2:
+                if method == 'linear':
+                    # Linear interpolation
+                    interp_func = interp1d(
+                        well_data.loc[valid_mask, md_col],
+                        well_data.loc[valid_mask, gr_col],
+                        kind='linear',
+                        bounds_error=False,
+                        fill_value='extrapolate'
+                    )
+                    imputed_values = interp_func(well_data[md_col])
+
+                elif method == 'nearest':
+                    interp_func = interp1d(
+                        well_data.loc[valid_mask, md_col],
+                        well_data.loc[valid_mask, gr_col],
+                        kind='nearest',
+                        bounds_error=False,
+                        fill_value='extrapolate'
+                    )
+                    imputed_values = interp_func(well_data[md_col])
+
+                else:  # rolling
+                    imputed_values = well_data[gr_col].fillna(method='ffill').fillna(method='bfill')
+
+                # Update only missing values
+                missing_idx = df.index[mask & df[gr_col].isna()]
+                df.loc[missing_idx, gr_col] = imputed_values[well_data[gr_col].isna()]
+                imputed_count += len(missing_idx)
+
+    print(f"  Total missing before: {total_missing:,}")
+    print(f"  Imputed: {imputed_count:,}")
+    print(f"  Remaining missing: {df[gr_col].isna().sum():,}")
+
+    return df
+
+# Apply GR imputation to test data
+print("\nImputing GR for Test Horizontal Data:")
+test_horizontal_imputed = impute_gr(test_horizontal, method='linear')
+
+# Create GR_imputed column (keep original for reference)
+test_horizontal_imputed['GR_original'] = test_horizontal['GR'].values
+test_horizontal_imputed['GR_imputed'] = test_horizontal_imputed['GR'].copy()
+
+print("\nGR Imputation Summary by Well:")
+for well_id in test_well_ids:
+    well_data = test_horizontal_imputed[test_horizontal_imputed['WELL_ID'] == well_id]
+    original_missing = well_data['GR_original'].isna().sum()
+    final_missing = well_data['GR_imputed'].isna().sum()
+    print(f"  {well_id}: {original_missing} \u2192 {final_missing} missing ({original_missing - final_missing} imputed)")
+
+# -----------------------------------------------------------------------------
+# STEP 2.3: Anchor Point Extraction
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.3: ANCHOR POINT EXTRACTION (Heel Section)")
+print("=" * 70)
+
+def extract_anchor_features(df, well_col='WELL_ID', md_col='MD', tvt_col='TVT_input', z_col='Z'):
+    """
+    Extract anchor point features from the heel section where TVT_input exists
+    """
+    df = df.copy()
+    df = df.sort_values([well_col, md_col]).reset_index(drop=True)
+
+    anchor_info = {}
+
+    for well_id in df[well_col].unique():
+        well_mask = df[well_col] == well_id
+        well_data = df.loc[well_mask].copy()
+
+        # Find anchor section (where TVT_input exists)
+        anchor_mask = well_data[tvt_col].notna()
+
+        if anchor_mask.any():
+            anchor_data = well_data[anchor_mask]
+
+            # Extract anchor statistics
+            anchor_info[well_id] = {
+                # Anchor boundaries
+                'anchor_md_min': anchor_data[md_col].min(),
+                'anchor_md_max': anchor_data[md_col].max(),
+                'anchor_z_min': anchor_data[z_col].min(),
+                'anchor_z_max': anchor_data[z_col].max(),
+                'anchor_tvt_min': anchor_data[tvt_col].min(),
+                'anchor_tvt_max': anchor_data[tvt_col].max(),
+
+                # Last anchor point (transition point to lateral)
+                'last_anchor_md': anchor_data[md_col].max(),
+                'last_anchor_z': anchor_data.loc[anchor_data[md_col].idxmax(), z_col],
+                'last_anchor_tvt': anchor_data.loc[anchor_data[md_col].idxmax(), tvt_col],
+
+                # Offset at last anchor point
+                'last_anchor_offset': (anchor_data.loc[anchor_data[md_col].idxmax(), tvt_col] +
+                                       anchor_data.loc[anchor_data[md_col].idxmax(), z_col]),
+
+                # TVT gradient in anchor section
+                'anchor_tvt_range': anchor_data[tvt_col].max() - anchor_data[tvt_col].min(),
+                'anchor_z_range': anchor_data[z_col].max() - anchor_data[z_col].min(),
+                'anchor_md_range': anchor_data[md_col].max() - anchor_data[md_col].min(),
+
+                # Count
+                'anchor_count': anchor_mask.sum(),
+                'total_count': len(well_data),
+                'anchor_coverage': anchor_mask.sum() / len(well_data)
+            }
+
+            # Calculate TVT/Z gradient if there's enough range
+            if abs(anchor_info[well_id]['anchor_z_range']) > 1:
+                anchor_info[well_id]['tvt_z_gradient'] = (
+                    anchor_info[well_id]['anchor_tvt_range'] /
+                    abs(anchor_info[well_id]['anchor_z_range'])
+                )
+            else:
+                anchor_info[well_id]['tvt_z_gradient'] = 1.0
+
+    return anchor_info
+
+# Extract anchor features for test wells
+anchor_features = extract_anchor_features(test_horizontal_imputed)
+
+print("\nAnchor Features Extracted:")
+print("-" * 50)
+for well_id, features in anchor_features.items():
+    print(f"\n{well_id}:")
+    print(f"  Anchor MD Range: {features['anchor_md_min']:.1f} - {features['anchor_md_max']:.1f} ft")
+    print(f"  Last Anchor TVT: {features['last_anchor_tvt']:.1f} ft")
+    print(f"  Last Anchor Z: {features['last_anchor_z']:.1f} ft")
+    print(f"  Last Anchor Offset (TVT+Z): {features['last_anchor_offset']:.1f} ft")
+    print(f"  TVT/Z Gradient: {features['tvt_z_gradient']:.3f}")
+    print(f"  Anchor Coverage: {features['anchor_coverage']*100:.1f}%")
+
+# -----------------------------------------------------------------------------
+# STEP 2.4: Z-Based TVT Extrapolation Features
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.4: Z-BASED TVT EXTRAPOLATION FEATURES")
+print("=" * 70)
+
+def create_z_extrapolation_features(df, anchor_info, well_col='WELL_ID', md_col='MD', z_col='Z'):
+    """
+    Create features for TVT extrapolation based on Z depth relationship
+    """
+    df = df.copy()
+
+    # Initialize new columns
+    df['Z_from_anchor'] = np.nan
+    df['MD_from_anchor'] = np.nan
+    df['TVT_extrapolated_offset'] = np.nan
+    df['TVT_extrapolated_gradient'] = np.nan
+    df['is_lateral'] = False
+    df['distance_to_anchor'] = np.nan
+
+    for well_id in df[well_col].unique():
+        if well_id not in anchor_info:
+            continue
+
+        well_mask = df[well_col] == well_id
+        anchor = anchor_info[well_id]
+
+        # Mark lateral section (beyond anchor)
+        df.loc[well_mask, 'is_lateral'] = df.loc[well_mask, md_col] > anchor['last_anchor_md']
+
+        # Z difference from last anchor point
+        df.loc[well_mask, 'Z_from_anchor'] = df.loc[well_mask, z_col] - anchor['last_anchor_z']
+
+        # MD difference from last anchor point
+        df.loc[well_mask, 'MD_from_anchor'] = df.loc[well_mask, md_col] - anchor['last_anchor_md']
+
+        # Distance to anchor (always positive)
+        df.loc[well_mask, 'distance_to_anchor'] = np.abs(df.loc[well_mask, md_col] - anchor['last_anchor_md'])
+
+        # Method 1: Constant Offset Extrapolation
+        # TVT = Offset - Z (where Offset = TVT + Z at anchor)
+        df.loc[well_mask, 'TVT_extrapolated_offset'] = anchor['last_anchor_offset'] - df.loc[well_mask, z_col]
+
+        # Method 2: Gradient-based Extrapolation
+        # TVT = last_TVT + gradient * delta_Z
+        z_delta = df.loc[well_mask, z_col] - anchor['last_anchor_z']
+        df.loc[well_mask, 'TVT_extrapolated_gradient'] = (
+            anchor['last_anchor_tvt'] + anchor['tvt_z_gradient'] * np.abs(z_delta)
+        )
+
+    return df
+
+# Apply Z-based extrapolation features
+test_horizontal_fe = create_z_extrapolation_features(test_horizontal_imputed, anchor_features)
+
+print("\nZ-Based Extrapolation Features Created:")
+print("-" * 50)
+
+for well_id in test_well_ids:
+    well_data = test_horizontal_fe[test_horizontal_fe['WELL_ID'] == well_id]
+    lateral_data = well_data[well_data['is_lateral']]
+
+    print(f"\n{well_id}:")
+    print(f"  Total rows: {len(well_data)}")
+    print(f"  Lateral rows (to predict): {len(lateral_data)}")
+    print(f"  Z_from_anchor range: {lateral_data['Z_from_anchor'].min():.1f} to {lateral_data['Z_from_anchor'].max():.1f} ft")
+    print(f"  TVT_extrapolated_offset range: {lateral_data['TVT_extrapolated_offset'].min():.1f} to {lateral_data['TVT_extrapolated_offset'].max():.1f} ft")
+
+# -----------------------------------------------------------------------------
+# STEP 2.5: Rolling GR Statistics
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.5: ROLLING GR STATISTICS")
+print("=" * 70)
+
+def create_gr_rolling_features(df, well_col='WELL_ID', md_col='MD', gr_col='GR_imputed', windows=[5, 10, 25, 50]):
+    """
+    Create rolling window statistics for GR
+    """
+    df = df.copy()
+    df = df.sort_values([well_col, md_col]).reset_index(drop=True)
+
+    for window in windows:
+        df[f'GR_mean_{window}'] = np.nan
+        df[f'GR_std_{window}'] = np.nan
+        df[f'GR_min_{window}'] = np.nan
+        df[f'GR_max_{window}'] = np.nan
+        df[f'GR_range_{window}'] = np.nan
+
+    df['GR_gradient'] = np.nan
+    df['GR_zscore'] = np.nan
+
+    for well_id in df[well_col].unique():
+        well_mask = df[well_col] == well_id
+        gr_values = df.loc[well_mask, gr_col].values
+
+        for window in windows:
+            if len(gr_values) >= window:
+                # Rolling mean
+                rolling_mean = pd.Series(gr_values).rolling(window, center=True, min_periods=1).mean().values
+                df.loc[well_mask, f'GR_mean_{window}'] = rolling_mean
+
+                # Rolling std
+                rolling_std = pd.Series(gr_values).rolling(window, center=True, min_periods=1).std().values
+                df.loc[well_mask, f'GR_std_{window}'] = rolling_std
+
+                # Rolling min/max
+                rolling_min = pd.Series(gr_values).rolling(window, center=True, min_periods=1).min().values
+                rolling_max = pd.Series(gr_values).rolling(window, center=True, min_periods=1).max().values
+                df.loc[well_mask, f'GR_min_{window}'] = rolling_min
+                df.loc[well_mask, f'GR_max_{window}'] = rolling_max
+                df.loc[well_mask, f'GR_range_{window}'] = rolling_max - rolling_min
+
+        # GR gradient (rate of change)
+        df.loc[well_mask, 'GR_gradient'] = np.gradient(gr_values)
+
+        # GR z-score (normalized)
+        gr_mean = np.nanmean(gr_values)
+        gr_std = np.nanstd(gr_values)
+        if gr_std > 0:
+            df.loc[well_mask, 'GR_zscore'] = (gr_values - gr_mean) / gr_std
+
+    return df
+
+# Apply rolling GR features
+test_horizontal_fe = create_gr_rolling_features(test_horizontal_fe)
+
+print("\nRolling GR Features Created:")
+print("-" * 50)
+gr_features = [col for col in test_horizontal_fe.columns if col.startswith('GR_') and col != 'GR_original']
+print(f"Total GR features: {len(gr_features)}")
+for feat in gr_features:
+    non_null = test_horizontal_fe[feat].notna().sum()
+    print(f"  {feat}: {non_null:,} non-null values")
+
+# -----------------------------------------------------------------------------
+# STEP 2.6: Spatial Trajectory Features
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.6: SPATIAL TRAJECTORY FEATURES")
+print("=" * 70)
+
+def create_spatial_features(df, well_col='WELL_ID', md_col='MD', x_col='X', y_col='Y', z_col='Z'):
+    """
+    Create features based on well trajectory
+    """
+    df = df.copy()
+    df = df.sort_values([well_col, md_col]).reset_index(drop=True)
+
+    # Initialize columns
+    df['dX'] = np.nan
+    df['dY'] = np.nan
+    df['dZ'] = np.nan
+    df['dMD'] = np.nan
+    df['horizontal_displacement'] = np.nan
+    df['total_displacement'] = np.nan
+    df['inclination'] = np.nan
+    df['azimuth'] = np.nan
+    df['curvature'] = np.nan
+
+    for well_id in df[well_col].unique():
+        well_mask = df[well_col] == well_id
+        idx = df.index[well_mask]
+
+        x = df.loc[well_mask, x_col].values
+        y = df.loc[well_mask, y_col].values
+        z = df.loc[well_mask, z_col].values
+        md = df.loc[well_mask, md_col].values
+
+        # Calculate differences
+        dx = np.diff(x, prepend=x[0])
+        dy = np.diff(y, prepend=y[0])
+        dz = np.diff(z, prepend=z[0])
+        dmd = np.diff(md, prepend=md[0])
+
+        df.loc[idx, 'dX'] = dx
+        df.loc[idx, 'dY'] = dy
+        df.loc[idx, 'dZ'] = dz
+        df.loc[idx, 'dMD'] = dmd
+
+        # Horizontal displacement per step
+        horiz_disp = np.sqrt(dx**2 + dy**2)
+        df.loc[idx, 'horizontal_displacement'] = horiz_disp
+
+        # Total displacement per step
+        total_disp = np.sqrt(dx**2 + dy**2 + dz**2)
+        df.loc[idx, 'total_displacement'] = total_disp
+
+        # Inclination (angle from vertical)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            inclination = np.degrees(np.arctan2(horiz_disp, np.abs(dz)))
+            inclination = np.where(np.isnan(inclination), 90, inclination)
+        df.loc[idx, 'inclination'] = inclination
+
+        # Azimuth (direction in XY plane)
+        azimuth = np.degrees(np.arctan2(dx, dy)) % 360
+        df.loc[idx, 'azimuth'] = azimuth
+
+        # Curvature (rate of direction change)
+        if len(azimuth) > 2:
+            curvature = np.abs(np.diff(azimuth, prepend=azimuth[0]))
+            curvature = np.minimum(curvature, 360 - curvature)  # Handle wrap-around
+            df.loc[idx, 'curvature'] = curvature
+
+    return df
+
+# Apply spatial features
+test_horizontal_fe = create_spatial_features(test_horizontal_fe)
+
+print("\nSpatial Trajectory Features Created:")
+print("-" * 50)
+spatial_features = ['dX', 'dY', 'dZ', 'dMD', 'horizontal_displacement',
+                    'total_displacement', 'inclination', 'azimuth', 'curvature']
+
+for feat in spatial_features:
+    mean_val = test_horizontal_fe[feat].mean()
+    std_val = test_horizontal_fe[feat].std()
+    print(f"  {feat}: mean={mean_val:.2f}, std={std_val:.2f}")
+
+# -----------------------------------------------------------------------------
+# STEP 2.7: Typewell GR Signature Features
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.7: TYPEWELL GR SIGNATURE FEATURES")
+print("=" * 70)
+
+def create_typewell_signatures(typewell_df, well_col='WELL_ID', tvt_col='TVT', gr_col='GR'):
+    """
+    Create GR signature lookup for each typewell
+    """
+    signatures = {}
+
+    for well_id in typewell_df[well_col].unique():
+        well_data = typewell_df[typewell_df[well_col] == well_id].copy()
+        well_data = well_data.sort_values(tvt_col).reset_index(drop=True)
+
+        # Remove missing GR
+        valid_data = well_data[well_data[gr_col].notna()]
+
+        if len(valid_data) > 10:
+            signatures[well_id] = {
+                'tvt': valid_data[tvt_col].values,
+                'gr': valid_data[gr_col].values,
+                'tvt_min': valid_data[tvt_col].min(),
+                'tvt_max': valid_data[tvt_col].max(),
+                'gr_mean': valid_data[gr_col].mean(),
+                'gr_std': valid_data[gr_col].std(),
+                'interp_func': interp1d(
+                    valid_data[tvt_col].values,
+                    valid_data[gr_col].values,
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value='extrapolate'
+                )
+            }
+
+    return signatures
+
+# Create typewell signatures
+typewell_signatures = create_typewell_signatures(test_typewell)
+
+print("\nTypewell Signatures Created:")
+print("-" * 50)
+for well_id, sig in typewell_signatures.items():
+    print(f"\n{well_id}:")
+    print(f"  TVT range: {sig['tvt_min']:.1f} - {sig['tvt_max']:.1f} ft")
+    print(f"  GR mean: {sig['gr_mean']:.1f} API")
+    print(f"  GR std: {sig['gr_std']:.1f} API")
+    print(f"  Data points: {len(sig['tvt'])}")
+
+# -----------------------------------------------------------------------------
+# STEP 2.8: GR Pattern Matching Features
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.8: GR PATTERN MATCHING FEATURES")
+print("=" * 70)
+
+def compute_gr_match_features(horizontal_df, typewell_signatures, anchor_info,
+                               well_col='WELL_ID', md_col='MD', gr_col='GR_imputed'):
+    """
+    Compute features that measure how well horizontal GR matches typewell GR
+    at different TVT levels
+    """
+    df = horizontal_df.copy()
+
+    # Initialize matching features
+    df['typewell_gr_at_extrapolated_tvt'] = np.nan
+    df['gr_residual'] = np.nan
+    df['gr_match_score'] = np.nan
+
+    for well_id in df[well_col].unique():
+        if well_id not in typewell_signatures or well_id not in anchor_info:
+            continue
+
+        well_mask = df[well_col] == well_id
+        sig = typewell_signatures[well_id]
+
+        # Get extrapolated TVT values
+        tvt_extrap = df.loc[well_mask, 'TVT_extrapolated_offset'].values
+
+        # Get horizontal GR values
+        horiz_gr = df.loc[well_mask, gr_col].values
+
+        # Get typewell GR at extrapolated TVT positions
+        typewell_gr = sig['interp_func'](tvt_extrap)
+        df.loc[well_mask, 'typewell_gr_at_extrapolated_tvt'] = typewell_gr
+
+        # Compute residual (horizontal GR - typewell GR)
+        residual = horiz_gr - typewell_gr
+        df.loc[well_mask, 'gr_residual'] = residual
+
+        # Compute match score (normalized by typewell std)
+        if sig['gr_std'] > 0:
+            match_score = 1 - np.abs(residual) / (2 * sig['gr_std'])
+            match_score = np.clip(match_score, 0, 1)
+            df.loc[well_mask, 'gr_match_score'] = match_score
+
+    return df
+
+# Apply GR matching features
+test_horizontal_fe = compute_gr_match_features(test_horizontal_fe, typewell_signatures, anchor_features)
+
+print("\nGR Matching Features Created:")
+print("-" * 50)
+for well_id in test_well_ids:
+    well_data = test_horizontal_fe[test_horizontal_fe['WELL_ID'] == well_id]
+    lateral = well_data[well_data['is_lateral']]
+
+    print(f"\n{well_id} (Lateral Section):")
+    print(f"  Mean GR Residual: {lateral['gr_residual'].mean():.2f} API")
+    print(f"  Std GR Residual: {lateral['gr_residual'].std():.2f} API")
+    print(f"  Mean Match Score: {lateral['gr_match_score'].mean():.3f}")
+
+# -----------------------------------------------------------------------------
+# STEP 2.9: Feature Summary
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.9: FEATURE ENGINEERING SUMMARY")
+print("=" * 70)
+
+# List all features created
+original_cols = ['WELL_ID', 'MD', 'X', 'Y', 'Z', 'GR', 'TVT_input']
+new_features = [col for col in test_horizontal_fe.columns if col not in original_cols]
+
+print(f"\nTotal Features Created: {len(new_features)}")
+print("-" * 50)
+
+# Categorize features
+categories = {
+    'GR Imputation': [c for c in new_features if 'original' in c or 'imputed' in c.lower()],
+    'Anchor/Extrapolation': [c for c in new_features if any(x in c.lower() for x in ['anchor', 'extrapolated', 'lateral', 'distance'])],
+    'Rolling GR Stats': [c for c in new_features if c.startswith('GR_') and any(x in c for x in ['mean', 'std', 'min', 'max', 'range', 'gradient', 'zscore'])],
+    'Spatial Trajectory': [c for c in new_features if c in spatial_features],
+    'GR Matching': [c for c in new_features if any(x in c.lower() for x in ['typewell', 'residual', 'match_score'])],
+    'Z-based': [c for c in new_features if 'Z_from' in c or 'MD_from' in c]
+}
+
+for category, features in categories.items():
+    if features:
+        print(f"\n{category}: ({len(features)} features)")
+        for f in features:
+            print(f"  • {f}")
+
+# -----------------------------------------------------------------------------
+# STEP 2.10: Save Engineered Features
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 2.10: SAVING ENGINEERED FEATURES")
+print("=" * 70)
+
+# Save the feature-engineered test data
+output_file = 'test_horizontal_features.parquet'
+test_horizontal_fe.to_parquet(output_file, index=False)
+print(f"\n✓ Saved: {output_file}")
+print(f"  Shape: {test_horizontal_fe.shape}")
+print(f"  Columns: {len(test_horizontal_fe.columns)}")
+
+# Also save anchor features as JSON for reference
+import json
+
+anchor_features_serializable = {}
+for well_id, features in anchor_features.items():
+    anchor_features_serializable[well_id] = {k: float(v) for k, v in features.items()}
+
+with open('anchor_features.json', 'w') as f:
+    json.dump(anchor_features_serializable, f, indent=2)
+print(f"✓ Saved: anchor_features.json")
+
+# Display final dataset info
+print("\n" + "=" * 70)
+print("FINAL FEATURE-ENGINEERED DATASET")
+print("=" * 70)
+
+print(f"\nDataset Shape: {test_horizontal_fe.shape}")
+print(f"\nColumn Types:")
+print(test_horizontal_fe.dtypes.value_counts())
+
+print(f"\nSample of Lateral Section Features (first 5 rows of well 000d7d20):")
+sample_cols = ['MD', 'Z', 'GR_imputed', 'TVT_extrapolated_offset',
+               'GR_mean_25', 'gr_residual', 'gr_match_score', 'inclination']
+sample_data = test_horizontal_fe[
+    (test_horizontal_fe['WELL_ID'] == '000d7d20') &
+    (test_horizontal_fe['is_lateral'])
+][sample_cols].head()
+print(sample_data.to_string())
+
+print("\n" + "=" * 70)
+print("PHASE 2 COMPLETE: FEATURE ENGINEERING FINISHED")
+print("=" * 70)
+print("""
+Next Steps for Phase 3 (Modeling):
+1. Use TVT_extrapolated_offset as baseline prediction
+2. Refine using GR pattern matching (minimize gr_residual)
+3. Apply cross-correlation or DTW for optimal TVT alignment
+4. Build ensemble model combining structural and GR-based approaches
+""")
