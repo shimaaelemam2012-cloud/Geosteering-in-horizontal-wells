@@ -1,0 +1,1015 @@
+# ============================================
+# PHASE 3: MODELING - TVT PREDICTION
+# ============================================
+
+import pandas as pd
+import numpy as np
+from scipy import signal
+from scipy.interpolate import interp1d
+import warnings
+warnings.filterwarnings('ignore')
+
+print("="*70)
+print("🎯 PHASE 3: TVT PREDICTION MODELING")
+print("="*70)
+
+# Load engineered features
+test_features = pd.read_parquet('test_horizontal_features.parquet')
+print(f"Test features loaded: {test_features.shape}")
+
+# Load original data for typewell access
+train_hz = pd.read_parquet('/content/train_horizontal.parquet')
+train_tw = pd.read_parquet('/content/train_typewell.parquet')
+test_hz = pd.read_parquet('/content/test_horizontal.parquet')
+test_tw = pd.read_parquet('/content/test_typewell.parquet')
+
+
+print(f"Train horizontal: {train_hz.shape}")
+print(f"Train typewell: {train_tw.shape}")
+
+# ============================================
+# STEP 3.1: VALIDATE ON TRAINING DATA FIRST
+# ============================================
+
+print("\n" + "="*70)
+print("📊 STEP 3.1: VALIDATION ON TRAINING DATA")
+print("="*70)
+
+# Sample wells for validation
+sample_wells = train_hz['WELL_ID'].unique()[:50]
+
+def extract_anchor_features(hz_data, well_id):
+    """Extract anchor features from horizontal data with TVT_input."""
+    well_hz = hz_data[hz_data['WELL_ID'] == well_id].sort_values('MD').copy()
+
+    # Find anchor points (where TVT_input is available)
+    if 'TVT_input' in well_hz.columns:
+        anchor_mask = well_hz['TVT_input'].notna()
+    else:
+        # Use first 25% as pseudo-anchors for training validation
+        n_anchor = int(len(well_hz) * 0.25)
+        anchor_mask = pd.Series([True]*n_anchor + [False]*(len(well_hz)-n_anchor), index=well_hz.index)
+
+    if anchor_mask.sum() == 0:
+        return None
+
+    anchor_data = well_hz[anchor_mask]
+
+    # Get last anchor point
+    last_anchor_idx = anchor_data.index[-1]
+    last_anchor = anchor_data.loc[last_anchor_idx]
+
+    # Calculate offset at anchor
+    if 'TVT_input' in well_hz.columns and pd.notna(last_anchor.get('TVT_input')):
+        last_tvt = last_anchor['TVT_input']
+    elif 'TVT' in well_hz.columns:
+        last_tvt = last_anchor['TVT']
+    else:
+        return None
+
+    last_z = last_anchor['Z']
+    offset = last_tvt + last_z  # TVT = -Z + offset
+
+    # Calculate gradient from anchor section
+    if len(anchor_data) > 10:
+        z_vals = anchor_data['Z'].values
+        if 'TVT_input' in anchor_data.columns:
+            tvt_vals = anchor_data['TVT_input'].fillna(anchor_data.get('TVT', np.nan)).values
+        else:
+            tvt_vals = anchor_data['TVT'].values
+
+        valid = ~np.isnan(tvt_vals)
+        if valid.sum() > 5:
+            gradient = np.polyfit(z_vals[valid], tvt_vals[valid], 1)[0]
+        else:
+            gradient = -1.0
+    else:
+        gradient = -1.0
+
+    return {
+        'last_anchor_md': last_anchor['MD'],
+        'last_anchor_z': last_z,
+        'last_anchor_tvt': last_tvt,
+        'offset': offset,
+        'gradient': gradient
+    }
+
+def predict_tvt_offset_based(hz_data, anchor_info):
+    """Predict TVT using offset extrapolation."""
+    z_vals = hz_data['Z'].values
+    offset = anchor_info['offset']
+    gradient = anchor_info['gradient']
+    last_z = anchor_info['last_anchor_z']
+    last_tvt = anchor_info['last_anchor_tvt']
+
+    # Method 1: Simple offset
+    pred_offset = -z_vals + offset
+
+    # Method 2: Gradient-based
+    z_diff = z_vals - last_z
+    pred_gradient = last_tvt + gradient * z_diff
+
+    # Blend: use gradient near anchor, transition to offset far away
+    distance = np.abs(z_vals - last_z)
+    max_dist = distance.max() if distance.max() > 0 else 1
+    blend_weight = np.clip(distance / max_dist, 0, 1)
+
+    pred_blended = (1 - blend_weight) * pred_gradient + blend_weight * pred_offset
+
+    return pred_offset, pred_gradient, pred_blended
+
+# Validate on sample wells
+validation_results = []
+
+for well_id in sample_wells:
+    well_hz = train_hz[train_hz['WELL_ID'] == well_id].sort_values('MD').copy()
+    well_tw = train_tw[train_tw['WELL_ID'] == well_id].sort_values('TVT').copy()
+
+    if len(well_hz) < 100 or 'TVT' not in well_hz.columns:
+        continue
+
+    # Simulate test scenario: use first 25% as anchors
+    n_anchor = int(len(well_hz) * 0.25)
+    anchor_section = well_hz.iloc[:n_anchor]
+    lateral_section = well_hz.iloc[n_anchor:]
+
+    if len(lateral_section) < 50:
+        continue
+
+    # Extract anchor info
+    anchor_info = {
+        'last_anchor_md': anchor_section['MD'].iloc[-1],
+        'last_anchor_z': anchor_section['Z'].iloc[-1],
+        'last_anchor_tvt': anchor_section['TVT'].iloc[-1],
+        'offset': anchor_section['TVT'].iloc[-1] + anchor_section['Z'].iloc[-1],
+        'gradient': -1.0
+    }
+
+    # Calculate gradient
+    if len(anchor_section) > 10:
+        z_vals = anchor_section['Z'].values[-20:]
+        tvt_vals = anchor_section['TVT'].values[-20:]
+        anchor_info['gradient'] = np.polyfit(z_vals, tvt_vals, 1)[0]
+
+    # Predict
+    pred_offset, pred_gradient, pred_blended = predict_tvt_offset_based(lateral_section, anchor_info)
+    true_tvt = lateral_section['TVT'].values
+
+    # Calculate errors
+    rmse_offset = np.sqrt(np.mean((pred_offset - true_tvt)**2))
+    rmse_gradient = np.sqrt(np.mean((pred_gradient - true_tvt)**2))
+    rmse_blended = np.sqrt(np.mean((pred_blended - true_tvt)**2))
+
+    validation_results.append({
+        'well_id': well_id,
+        'n_lateral': len(lateral_section),
+        'rmse_offset': rmse_offset,
+        'rmse_gradient': rmse_gradient,
+        'rmse_blended': rmse_blended
+    })
+
+val_df = pd.DataFrame(validation_results)
+print(f"\nValidation on {len(val_df)} wells:")
+print(f"  Offset-based RMSE:   {val_df['rmse_offset'].mean():.2f} ± {val_df['rmse_offset'].std():.2f} ft")
+print(f"  Gradient-based RMSE: {val_df['rmse_gradient'].mean():.2f} ± {val_df['rmse_gradient'].std():.2f} ft")
+print(f"  Blended RMSE:        {val_df['rmse_blended'].mean():.2f} ± {val_df['rmse_blended'].std():.2f} ft")
+
+# ============================================
+# STEP 3.2: GR-BASED TVT REFINEMENT
+# ============================================
+
+print("\n" + "="*70)
+print("📈 STEP 3.2: GR-BASED TVT REFINEMENT")
+print("="*70)
+
+def find_best_tvt_by_gr_correlation(hz_gr, tw_gr, tw_tvt, baseline_tvt, search_range=50):
+    """
+    Find best TVT by matching horizontal GR to typewell GR.
+    Search within ±search_range of baseline_tvt.
+    """
+    if np.isnan(hz_gr) or len(tw_gr) < 10:
+        return baseline_tvt, 0.0
+
+    # Create interpolated typewell GR function
+    valid_mask = ~np.isnan(tw_gr) & ~np.isnan(tw_tvt)
+    if valid_mask.sum() < 10:
+        return baseline_tvt, 0.0
+
+    tw_gr_valid = tw_gr[valid_mask]
+    tw_tvt_valid = tw_tvt[valid_mask]
+
+    # Sort by TVT
+    sort_idx = np.argsort(tw_tvt_valid)
+    tw_tvt_sorted = tw_tvt_valid[sort_idx]
+    tw_gr_sorted = tw_gr_valid[sort_idx]
+
+    # Find TVT where typewell GR is closest to horizontal GR
+    min_tvt = max(tw_tvt_sorted.min(), baseline_tvt - search_range)
+    max_tvt = min(tw_tvt_sorted.max(), baseline_tvt + search_range)
+
+    if min_tvt >= max_tvt:
+        return baseline_tvt, 0.0
+
+    # Search for best match
+    tvt_candidates = np.linspace(min_tvt, max_tvt, 100)
+    gr_interp = interp1d(tw_tvt_sorted, tw_gr_sorted, kind='linear',
+                         bounds_error=False, fill_value='extrapolate')
+
+    tw_gr_at_candidates = gr_interp(tvt_candidates)
+    gr_diff = np.abs(tw_gr_at_candidates - hz_gr)
+
+    best_idx = np.argmin(gr_diff)
+    best_tvt = tvt_candidates[best_idx]
+    match_score = 1.0 / (1.0 + gr_diff[best_idx])
+
+    return best_tvt, match_score
+
+def refine_tvt_with_gr_sequence(hz_data, tw_data, baseline_tvt, window=10):
+    """
+    Refine TVT predictions using GR sequence correlation.
+    """
+    hz_gr = hz_data['GR'].values if 'GR' in hz_data.columns else hz_data['GR_imputed'].values
+    hz_md = hz_data['MD'].values
+
+    tw_gr = tw_data['GR'].values
+    tw_tvt = tw_data['TVT'].values
+
+    refined_tvt = baseline_tvt.copy()
+    match_scores = np.zeros(len(baseline_tvt))
+
+    for i in range(len(hz_data)):
+        # Get local GR window
+        start_idx = max(0, i - window//2)
+        end_idx = min(len(hz_data), i + window//2)
+
+        local_hz_gr = hz_gr[start_idx:end_idx]
+        local_baseline = baseline_tvt[start_idx:end_idx]
+
+        if len(local_hz_gr) < 3 or np.all(np.isnan(local_hz_gr)):
+            continue
+
+        # Find best TVT for center point
+        center_gr = hz_gr[i]
+        center_baseline = baseline_tvt[i]
+
+        best_tvt, score = find_best_tvt_by_gr_correlation(
+            center_gr, tw_gr, tw_tvt, center_baseline, search_range=30
+        )
+
+        refined_tvt[i] = best_tvt
+        match_scores[i] = score
+
+    return refined_tvt, match_scores
+
+# Test GR refinement on sample wells
+gr_validation_results = []
+
+for well_id in sample_wells[:20]:  # Subset for speed
+    well_hz = train_hz[train_hz['WELL_ID'] == well_id].sort_values('MD').copy()
+    well_tw = train_tw[train_tw['WELL_ID'] == well_id].sort_values('TVT').copy()
+
+    if len(well_hz) < 100 or len(well_tw) < 50:
+        continue
+
+    # Simulate test scenario
+    n_anchor = int(len(well_hz) * 0.25)
+    lateral_section = well_hz.iloc[n_anchor:].copy()
+
+    if len(lateral_section) < 50:
+        continue
+
+    # Get baseline prediction
+    anchor_info = {
+        'last_anchor_md': well_hz['MD'].iloc[n_anchor-1],
+        'last_anchor_z': well_hz['Z'].iloc[n_anchor-1],
+        'last_anchor_tvt': well_hz['TVT'].iloc[n_anchor-1],
+        'offset': well_hz['TVT'].iloc[n_anchor-1] + well_hz['Z'].iloc[n_anchor-1],
+        'gradient': -1.0
+    }
+
+    baseline_tvt = -lateral_section['Z'].values + anchor_info['offset']
+
+    # Refine with GR
+    refined_tvt, match_scores = refine_tvt_with_gr_sequence(
+        lateral_section, well_tw, baseline_tvt, window=10
+    )
+
+    true_tvt = lateral_section['TVT'].values
+
+    # Blend based on match score
+    blend_weight = np.clip(match_scores * 2, 0, 0.8)  # Max 80% from GR
+    blended_tvt = (1 - blend_weight) * baseline_tvt + blend_weight * refined_tvt
+
+    # Calculate errors
+    rmse_baseline = np.sqrt(np.mean((baseline_tvt - true_tvt)**2))
+    rmse_gr_refined = np.sqrt(np.mean((refined_tvt - true_tvt)**2))
+    rmse_blended = np.sqrt(np.mean((blended_tvt - true_tvt)**2))
+
+    gr_validation_results.append({
+        'well_id': well_id,
+        'rmse_baseline': rmse_baseline,
+        'rmse_gr_refined': rmse_gr_refined,
+        'rmse_blended': rmse_blended,
+        'mean_match_score': match_scores.mean()
+    })
+
+gr_val_df = pd.DataFrame(gr_validation_results)
+print(f"\nGR Refinement Validation on {len(gr_val_df)} wells:")
+print(f"  Baseline RMSE:     {gr_val_df['rmse_baseline'].mean():.2f} ± {gr_val_df['rmse_baseline'].std():.2f} ft")
+print(f"  GR-Refined RMSE:   {gr_val_df['rmse_gr_refined'].mean():.2f} ± {gr_val_df['rmse_gr_refined'].std():.2f} ft")
+print(f"  Blended RMSE:      {gr_val_df['rmse_blended'].mean():.2f} ± {gr_val_df['rmse_blended'].std():.2f} ft")
+print(f"  Mean Match Score:  {gr_val_df['mean_match_score'].mean():.3f}")
+
+# ============================================
+# STEP 3.3: APPLY TO TEST DATA
+# ============================================
+
+print("\n" + "="*70)
+print("🎯 STEP 3.3: APPLYING TO TEST DATA")
+print("="*70)
+
+test_wells = test_features['WELL_ID'].unique()
+print(f"Test wells: {test_wells}")
+
+final_predictions = []
+
+for well_id in test_wells:
+    print(f"\nProcessing well: {well_id}")
+
+    # Get test data
+    well_test = test_features[test_features['WELL_ID'] == well_id].sort_values('MD').copy()
+    well_tw = test_tw[test_tw['WELL_ID'] == well_id].sort_values('TVT').copy()
+
+    print(f"  Test points: {len(well_test)}")
+    print(f"  Typewell points: {len(well_tw)}")
+
+    # Identify anchor vs lateral
+    if 'is_lateral' in well_test.columns:
+        anchor_mask = ~well_test['is_lateral']
+        lateral_mask = well_test['is_lateral']
+    else:
+        # Use TVT_input availability
+        anchor_mask = well_test['TVT_input'].notna() if 'TVT_input' in well_test.columns else pd.Series([False]*len(well_test))
+        lateral_mask = ~anchor_mask
+
+    print(f"  Anchor points: {anchor_mask.sum()}")
+    print(f"  Lateral points: {lateral_mask.sum()}")
+
+    # Initialize predictions
+    well_test['TVT_pred'] = np.nan
+
+    # For anchor points: use TVT_input directly (or extrapolated if not available)
+    if 'TVT_input' in well_test.columns:
+        well_test.loc[anchor_mask, 'TVT_pred'] = well_test.loc[anchor_mask, 'TVT_input']
+
+    # For lateral points: use TVT_extrapolated_offset as baseline
+    if 'TVT_extrapolated_offset' in well_test.columns:
+        baseline_tvt = well_test.loc[lateral_mask, 'TVT_extrapolated_offset'].values
+    else:
+        # Fallback: simple offset
+        last_anchor = well_test[anchor_mask].iloc[-1] if anchor_mask.sum() > 0 else well_test.iloc[0]
+        offset = last_anchor.get('TVT_input', 0) + last_anchor['Z']
+        baseline_tvt = -well_test.loc[lateral_mask, 'Z'].values + offset
+
+    # Refine with GR matching
+    lateral_data = well_test[lateral_mask].copy()
+
+    if len(well_tw) > 20 and len(lateral_data) > 0:
+        refined_tvt, match_scores = refine_tvt_with_gr_sequence(
+            lateral_data, well_tw, baseline_tvt, window=10
+        )
+
+        # Blend based on confidence
+        blend_weight = np.clip(match_scores * 1.5, 0, 0.6)
+        final_tvt = (1 - blend_weight) * baseline_tvt + blend_weight * refined_tvt
+
+        print(f"  Mean match score: {match_scores.mean():.3f}")
+        print(f"  TVT range: {final_tvt.min():.1f} - {final_tvt.max():.1f}")
+    else:
+        final_tvt = baseline_tvt
+        print(f"  Using baseline (no GR refinement)")
+
+    well_test.loc[lateral_mask, 'TVT_pred'] = final_tvt
+
+    # Smooth predictions
+    if len(well_test) > 10:
+        well_test['TVT_pred_smooth'] = well_test['TVT_pred'].rolling(window=5, center=True, min_periods=1).mean()
+    else:
+        well_test['TVT_pred_smooth'] = well_test['TVT_pred']
+
+    final_predictions.append(well_test[['WELL_ID', 'MD', 'TVT_pred', 'TVT_pred_smooth']])
+
+# Combine predictions
+predictions_df = pd.concat(final_predictions, ignore_index=True)
+print(f"\nTotal predictions: {len(predictions_df)}")
+
+# ============================================
+# STEP 3.4: PREPARE SUBMISSION
+# ============================================
+
+print("\n" + "="*70)
+print("📝 STEP 3.4: PREPARING SUBMISSION")
+print("="*70)
+
+# Load sample submission to get exact format
+sample_sub = pd.read_csv('/content/dataset/sample_submission.csv')
+print(f"Sample submission shape: {sample_sub.shape}")
+print(f"Sample submission columns: {sample_sub.columns.tolist()}")
+
+# Merge predictions with test data
+test_hz_full = pd.read_parquet('/content/test_horizontal.parquet')
+
+# Create submission
+submission = test_hz_full[['WELL_ID', 'MD']].copy()
+submission = submission.merge(predictions_df[['WELL_ID', 'MD', 'TVT_pred_smooth']],
+                               on=['WELL_ID', 'MD'], how='left')
+
+# Rename to match submission format
+submission = submission.rename(columns={'TVT_pred_smooth': 'TVT'})
+
+# Fill any missing values
+if submission['TVT'].isna().sum() > 0:
+    print(f"Warning: {submission['TVT'].isna().sum()} missing predictions")
+    # Use simple extrapolation for missing
+    submission['TVT'] = submission.groupby('WELL_ID')['TVT'].transform(
+        lambda x: x.fillna(method='ffill').fillna(method='bfill')
+    )
+
+print(f"\nSubmission shape: {submission.shape}")
+print(f"Submission preview:")
+print(submission.head(10))
+
+# Save submission
+submission[['WELL_ID', 'MD', 'TVT']].to_csv('submission.csv', index=False)
+print(f"\n✓ Submission saved: submission.csv")
+
+# Summary statistics
+print("\n" + "="*70)
+print("📊 SUBMISSION SUMMARY")
+print("="*70)
+for well_id in submission['WELL_ID'].unique():
+    well_sub = submission[submission['WELL_ID'] == well_id]
+    print(f"\n{well_id}:")
+    print(f"  Points: {len(well_sub)}")
+    print(f"  TVT range: {well_sub['TVT'].min():.1f} - {well_sub['TVT'].max():.1f} ft")
+    print(f"  TVT mean: {well_sub['TVT'].mean():.1f} ft")
+    print(f"  TVT std: {well_sub['TVT'].std():.2f} ft")
+!pip install catboost fastdtw
+
+import pandas as pd
+import numpy as np
+from catboost import CatBoostRegressor
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error
+from fastdtw import fastdtw
+import warnings
+warnings.filterwarnings('ignore')
+
+print("="*60)
+print("🚀 GRANDMASTER CATBOOST MODEL WITH DTW INTEGRATION")
+print("="*60)
+
+# Load data
+print("\n[1] Loading data...")
+train = pd.read_parquet('/content/train_horizontal.parquet')
+test = pd.read_parquet('/content/test_horizontal.parquet')
+typewell = pd.read_parquet('/content/train_typewell.parquet')
+
+print(f"Train shape: {train.shape}")
+print(f"Test shape: {test.shape}")
+print(f"Typewell shape: {typewell.shape}")
+
+# =============================================================
+# FEATURE ENGINEERING WITH FAST-DTW
+# =============================================================
+print("\n[2] Feature Engineering (DTW Alignment Initiated)...")
+
+def engineer_features(df, typewell_df, is_train=True):
+    """Create features for the model including DTW alignment"""
+    df = df.copy()
+
+    # Basic features
+    df['offset'] = df['TVT'] + df['Z'] if 'TVT' in df.columns else np.nan
+    global_mean_offset = 2112.8
+
+    df['Z_abs'] = df['Z'].abs()
+    df['estimated_TVT_from_Z'] = -df['Z'] + global_mean_offset
+    df['GR_filled'] = df['GR'].fillna(df['GR'].median() if df['GR'].notna().any() else 75)
+
+    well_features = []
+    unique_wells = df['WELL_ID'].unique()
+    total_wells = len(unique_wells)
+
+    for i, well_id in enumerate(unique_wells):
+        if i % 50 == 0:
+            print(f"   -> Processing Well {i}/{total_wells}...")
+
+        well_mask = df['WELL_ID'] == well_id
+        well_data = df[well_mask].copy().sort_values('MD')
+
+        # Spatial features
+        well_data['MD_min'] = well_data['MD'].min()
+        well_data['MD_max'] = well_data['MD'].max()
+        well_data['MD_range'] = well_data['MD_max'] - well_data['MD_min']
+        well_data['MD_normalized'] = (well_data['MD'] - well_data['MD_min']) / (well_data['MD_range'] + 1e-6)
+
+        well_data['Z_min'] = well_data['Z'].min()
+        well_data['Z_max'] = well_data['Z'].max()
+        well_data['Z_range'] = well_data['Z_max'] - well_data['Z_min']
+
+        # Rolling GR stats
+        well_data['GR_roll_mean_5'] = well_data['GR_filled'].rolling(5, min_periods=1, center=True).mean()
+        well_data['GR_roll_std_5'] = well_data['GR_filled'].rolling(5, min_periods=1, center=True).std().fillna(0)
+        well_data['GR_roll_mean_10'] = well_data['GR_filled'].rolling(10, min_periods=1, center=True).mean()
+        well_data['GR_roll_std_10'] = well_data['GR_filled'].rolling(10, min_periods=1, center=True).std().fillna(0)
+        well_data['GR_roll_mean_20'] = well_data['GR_filled'].rolling(20, min_periods=1, center=True).mean()
+
+        # Derivatives
+        well_data['GR_diff'] = well_data['GR_filled'].diff().fillna(0)
+        well_data['GR_diff2'] = well_data['GR_diff'].diff().fillna(0)
+        well_data['Z_diff'] = well_data['Z'].diff().fillna(0)
+        well_data['MD_diff'] = well_data['MD'].diff().fillna(well_data['MD'].diff().median())
+        well_data['Z_gradient'] = well_data['Z_diff'] / (well_data['MD_diff'] + 1e-6)
+        well_data['inclination_proxy'] = np.arctan(well_data['Z_gradient'].clip(-1, 1)) * 180 / np.pi
+        well_data['cumsum_Z_diff'] = well_data['Z_diff'].cumsum()
+
+        # Extrapolations and anchor points
+        if is_train:
+            well_data['TVT_lag1'] = well_data['TVT'].shift(1)
+            well_data['TVT_lag5'] = well_data['TVT'].shift(5)
+            well_data['TVT_diff'] = well_data['TVT'].diff().fillna(0)
+            tvt_for_match = well_data['TVT']
+        else:
+            tvt_col = 'TVT_input' if 'TVT_input' in well_data.columns else 'TVT'
+            known_tvt_mask = well_data[tvt_col].notna()
+            if known_tvt_mask.any():
+                last_known_idx = well_data[known_tvt_mask].index[-1]
+                last_known_tvt = well_data.loc[last_known_idx, tvt_col]
+                last_known_z = well_data.loc[last_known_idx, 'Z']
+                last_known_md = well_data.loc[last_known_idx, 'MD']
+
+                well_data['last_known_TVT'] = last_known_tvt
+                well_data['last_known_Z'] = last_known_z
+                well_data['last_known_MD'] = last_known_md
+                well_data['dist_from_last_known'] = well_data['MD'] - last_known_md
+                well_data['Z_change_from_known'] = well_data['Z'] - last_known_z
+                last_offset = last_known_tvt + last_known_z
+                well_data['TVT_extrapolated'] = -well_data['Z'] + last_offset
+            else:
+                well_data['last_known_TVT'] = np.nan
+                well_data['last_known_Z'] = np.nan
+                well_data['last_known_MD'] = np.nan
+                well_data['dist_from_last_known'] = np.nan
+                well_data['Z_change_from_known'] = np.nan
+                well_data['TVT_extrapolated'] = -well_data['Z'] + global_mean_offset
+
+            tvt_for_match = well_data['TVT_extrapolated']
+
+        tvt_for_match = tvt_for_match.fillna(well_data['estimated_TVT_from_Z'])
+
+        # =========================================================
+        # 🔥 THE DTW INJECTION 🔥
+        # =========================================================
+        tw_data = typewell_df[typewell_df['WELL_ID'] == well_id].sort_values('TVT').dropna(subset=['TVT', 'GR'])
+
+        if len(tw_data) > 1 and len(well_data) > 1:
+            lat_gr = well_data['GR_filled'].values
+            tw_gr = tw_data['GR'].values
+            tw_tvt = tw_data['TVT'].values
+
+            # 1. Run Dynamic Time Warping (Radius 50 prevents impossible geological leaps)
+            distance, path = fastdtw(lat_gr, tw_gr, radius=50, dist=lambda a, b: abs(a - b))
+
+            # 2. Map the Typewell TVT to the Lateral MD based on the DTW path
+            dtw_tvt_aligned = np.zeros(len(lat_gr))
+            counts = np.zeros(len(lat_gr))
+            for lat_idx, tw_idx in path:
+                dtw_tvt_aligned[lat_idx] += tw_tvt[tw_idx]
+                counts[lat_idx] += 1
+
+            # Average multi-matches and fill the feature
+            well_data['DTW_TVT_match'] = dtw_tvt_aligned / counts
+
+            # 3. Old Interpolation as a backup/secondary feature
+            from scipy.interpolate import interp1d
+            interp = interp1d(tw_data['TVT'], tw_data['GR'], kind='nearest', bounds_error=False, fill_value='extrapolate')
+            well_data['typewell_GR_match'] = interp(tvt_for_match)
+
+        else:
+            well_data['DTW_TVT_match'] = tvt_for_match # Fallback to extrapolation if typewell missing
+            well_data['typewell_GR_match'] = np.nan
+
+        well_data['typewell_TVT_match'] = tvt_for_match
+        well_data['GR_typewell_diff'] = well_data['GR_filled'] - well_data['typewell_GR_match']
+        well_data['DTW_residual_proxy'] = well_data['DTW_TVT_match'] - well_data['typewell_TVT_match']
+
+        well_features.append(well_data)
+
+    return pd.concat(well_features, ignore_index=True)
+
+print("Engineering training features (This will take a few minutes for DTW)...")
+train_fe = engineer_features(train, typewell, is_train=True)
+
+print("Engineering test features...")
+test_fe = engineer_features(test, typewell, is_train=False)
+
+# =============================================================
+# PREPARE FEATURES FOR MODEL
+# =============================================================
+print("\n[3] Preparing features for model...")
+
+feature_cols = [
+    'MD', 'Z', 'Z_abs', 'GR_filled', 'estimated_TVT_from_Z',
+    'MD_normalized', 'MD_range', 'Z_range',
+    'GR_roll_mean_5', 'GR_roll_std_5', 'GR_roll_mean_10', 'GR_roll_std_10', 'GR_roll_mean_20',
+    'GR_diff', 'GR_diff2',
+    'Z_diff', 'Z_gradient', 'inclination_proxy', 'cumsum_Z_diff',
+    'typewell_GR_match', 'typewell_TVT_match', 'GR_typewell_diff',
+    'DTW_TVT_match', 'DTW_residual_proxy' # <-- The new ultra-features
+]
+
+train_feature_cols = feature_cols + ['TVT_lag1', 'TVT_lag5', 'TVT_diff', 'offset']
+train_feature_cols = [c for c in train_feature_cols if c in train_fe.columns]
+
+test_extra = ['last_known_TVT', 'last_known_Z', 'dist_from_last_known', 'Z_change_from_known', 'TVT_extrapolated']
+test_feature_cols = [c for c in feature_cols if c in test_fe.columns] + [c for c in test_extra if c in test_fe.columns]
+
+common_features = [c for c in feature_cols if c in train_fe.columns and c in test_fe.columns]
+print(f"Common features for model: {len(common_features)}")
+
+X_train = train_fe[common_features].copy()
+y_train = train_fe['TVT'].copy()
+groups = train_fe['WELL_ID'].copy()
+
+X_train = X_train.fillna(X_train.median())
+
+
+ =============================================================
+# [4] ENHANCED K-FOLD CROSS VALIDATION
+# =============================================================
+print("\n[4] Running Enhanced K-Fold Cross Validation...")
+
+n_splits = 5
+gkf = GroupKFold(n_splits=n_splits)
+
+fold_rmse = []
+oof_predictions = np.zeros(len(X_train))
+
+# Modified parameters to prevent premature shrinking
+catboost_params = {
+    'iterations': 2000,             # Increased maximum iterations
+    'learning_rate': 0.02,          # Halved to ensure smooth, deep learning
+    'depth': 7,
+    'l2_leaf_reg': 5.0,             # Added to prevent rapid overfitting
+    'loss_function': 'RMSE',
+    'eval_metric': 'RMSE',
+    'random_seed': 42,
+    'verbose': 250,
+    'early_stopping_rounds': 150,   # Tripled patience before shrinking
+    'task_type': 'GPU',
+    'devices': '0'
+}
+
+try:
+    test_model = CatBoostRegressor(**catboost_params)
+    test_model.fit(X_train.head(10), y_train.head(10), verbose=False)
+    print("🚀 Using GPU for training")
+except:
+    catboost_params['task_type'] = 'CPU'
+    if 'devices' in catboost_params: del catboost_params['devices']
+    print("⚙️ Using CPU for training")
+
+models = []
+
+for fold, (train_idx, val_idx) in enumerate(gkf.split(X_train, y_train, groups)):
+    print(f"\n{'='*40}\nFOLD {fold + 1}/{n_splits}\n{'='*40}")
+
+    X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+    y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+    model = CatBoostRegressor(**catboost_params)
+    model.fit(X_tr, y_tr, eval_set=(X_val, y_val), verbose=250)
+
+    val_pred = model.predict(X_val)
+    oof_predictions[val_idx] = val_pred
+
+    fold_rmse_val = np.sqrt(mean_squared_error(y_val, val_pred))
+    fold_rmse.append(fold_rmse_val)
+    print(f"\n✅ Fold {fold + 1} RMSE: {fold_rmse_val:.4f}")
+    models.append(model)
+
+print("\n" + "="*60)
+print("🏆 ENHANCED CROSS VALIDATION RESULTS")
+print("="*60)
+print(f"Mean RMSE: {np.mean(fold_rmse):.4f} (+/- {np.std(fold_rmse):.4f})")
+print(f"Overall OOF RMSE: {np.sqrt(mean_squared_error(y_train, oof_predictions)):.4f}")
+
+# =============================================================
+# [5] FEATURE IMPORTANCE & PRESENTATION CHART
+# =============================================================
+print("\n[5] Calculating Feature Importance...")
+
+# Average feature importance across all folds for stability
+importances = np.zeros(len(common_features))
+for model in models:
+    importances += model.get_feature_importance() / len(models)
+
+feat_imp = pd.DataFrame({
+    'feature': common_features,
+    'importance': importances
+}).sort_values('importance', ascending=False)
+
+# --- GENERATE POSTER-READY CHART ---
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.figure(figsize=(10, 6), dpi=300)
+top_features = feat_imp.head(12) # Focus on top 12 for clean visual
+sns.barplot(x='importance', y='feature', data=top_features, palette='Blues_r')
+
+plt.title('CatBoost Geosteering Model: Top Feature Importances', fontsize=14, fontweight='bold', pad=15)
+plt.xlabel('Relative Importance (%)', fontsize=12, fontweight='bold')
+plt.ylabel('Feature Name', fontsize=12, fontweight='bold')
+plt.grid(axis='x', linestyle='--', alpha=0.6)
+
+# Format y-labels to look professional
+clean_labels = [label.get_text().replace('_', ' ').title() for label in plt.gca().get_yticklabels()]
+plt.gca().set_yticklabels(clean_labels)
+
+plt.tight_layout()
+plt.savefig('CatBoost_Feature_Importance.png', dpi=300)
+print("📊 Feature importance chart saved as 'CatBoost_Feature_Importance.png'")
+
+# =============================================================
+# [6] PREDICTING ON TEST DATA
+# =============================================================
+print("\n[6] Predicting on test data & Creating submission...")
+X_test = test_fe[common_features].copy()
+X_test = X_test.fillna(X_test.median())
+
+test_predictions = np.zeros(len(X_test))
+for model in models:
+    test_predictions += model.predict(X_test) / len(models)
+
+test_fe['TVT_predicted'] = test_predictions
+
+if 'TVT_extrapolated' in test_fe.columns:
+    mask_no_extrap = test_fe['TVT_extrapolated'].isna()
+    test_fe.loc[mask_no_extrap, 'TVT_extrapolated'] = test_fe.loc[mask_no_extrap, 'estimated_TVT_from_Z']
+    blend_weight = test_fe['dist_from_last_known'].clip(0, 1000) / 1000
+    blend_weight = blend_weight.fillna(0.5)
+    test_fe['TVT_final'] = (1 - blend_weight) * test_fe['TVT_extrapolated'] + blend_weight * test_fe['TVT_predicted']
+else:
+    test_fe['TVT_final'] = test_fe['TVT_predicted']
+
+submission_mask = test['TVT_input'].isna()
+submission_df = test[submission_mask][['WELL_ID', 'MD']].copy()
+submission_df = submission_df.merge(test_fe[['WELL_ID', 'MD', 'TVT_final']], on=['WELL_ID', 'MD'], how='left')
+submission_df = submission_df.rename(columns={'TVT_final': 'TVT'})
+
+if submission_df['TVT'].isna().any():
+    submission_df['TVT'] = submission_df['TVT'].fillna(submission_df['TVT'].median())
+
+submission_df = submission_df[['WELL_ID', 'MD', 'TVT']]
+submission_df.to_csv('Tawila_Submission_Grandmaster.csv', index=False)
+print("\n✓ Final prediction saved to 'Tawila_Submission_Grandmaster.csv'")
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+print("="*60)
+print("🚀 LAUNCHING REGULARIZED LIGHTGBM + DTW (K-FOLD VALIDATION)")
+print("="*60)
+
+# 1. Extract and Sanitize Data
+print("Extracting and sanitizing data...")
+X_train_df = train_fe[common_features].copy()
+y_train = train_fe['TVT'].ffill().bfill().fillna(0).values
+groups = train_fe['WELL_ID'].copy()
+
+X = X_train_df.values
+X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+# 2. Configure LightGBM (Anti-Overfitting Parameters)
+params = {
+    'objective': 'regression',
+    'metric': 'rmse',
+    'boosting_type': 'gbdt',
+    'learning_rate': 0.03,
+    'num_leaves': 31,                # Halved from 63 to restrict complexity
+    'max_depth': 6,                  # Reduced from 8 to force macro-geological learning
+    'min_child_samples': 2500,       # Massively increased: prevents fitting to microscopic anomalies
+    'feature_fraction': 0.7,         # Drops more features per tree
+    'bagging_fraction': 0.7,         # Drops more rows per tree
+    'bagging_freq': 1,
+    'reg_alpha': 1.0,                # Increased L1 penalty
+    'reg_lambda': 10.0,              # Massive L2 penalty to smooth predictions
+    'verbose': -1,
+    'random_state': 42,
+    'n_jobs': -1
+}
+
+# 3. K-Fold Cross Validation
+print("Training LightGBM Engine with 5-Fold CV...")
+n_splits = 5
+gkf = GroupKFold(n_splits=n_splits)
+
+fold_rmse = []
+oof_predictions = np.zeros(len(X))
+models = []
+
+for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y_train, groups)):
+    print(f"\n--- FOLD {fold + 1}/{n_splits} ---")
+
+    X_tr, X_val = X[train_idx], X[val_idx]
+    y_tr, y_val = y_train[train_idx], y_train[val_idx]
+
+    train_data = lgb.Dataset(X_tr, label=y_tr, feature_name=common_features)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data, feature_name=common_features)
+
+    model_lgb = lgb.train(
+        params,
+        train_data,
+        num_boost_round=2500,        # Increased rounds to compensate for lower learning rate
+        valid_sets=[train_data, val_data],
+        callbacks=[lgb.early_stopping(stopping_rounds=150, verbose=False),
+                   lgb.log_evaluation(period=250)]
+    )
+
+    val_pred = model_lgb.predict(X_val, num_iteration=model_lgb.best_iteration)
+    oof_predictions[val_idx] = val_pred
+
+    rmse = np.sqrt(mean_squared_error(y_val, val_pred))
+    fold_rmse.append(rmse)
+    models.append(model_lgb)
+    print(f"✅ Fold {fold + 1} RMSE: {rmse:.4f}")
+
+# 4. Final RMSE Evaluation
+overall_rmse = np.sqrt(mean_squared_error(y_train, oof_predictions))
+
+print("\n" + "="*60)
+print(f"🔥 FINAL LIGHTGBM + DTW OOF RMSE: {overall_rmse:.2f} FEET 🔥")
+print(f"   Mean Fold RMSE: {np.mean(fold_rmse):.2f} ± {np.std(fold_rmse):.2f} FEET")
+print("="*60)
+
+# 5. Prove it to the Committee: Feature Importance Plot
+print("\nGenerating Feature Importance Plot for Defense...")
+plt.figure(figsize=(10, 6), dpi=300) # Added high DPI for poster resolution
+lgb.plot_importance(models[-1], max_num_features=13, importance_type='gain',
+                    title='What drives Geosteering Accuracy? (LightGBM Feature Importance)',
+                    xlabel='Feature Importance (Information Gain)',
+                    ylabel='Geological Features',
+                    color='#1E3A8A', # Updated to match your poster's navy blue aesthetic
+                    grid=False)
+plt.tight_layout()
+plt.savefig('LightGBM_Feature_Importance.png', dpi=300)
+plt.show()
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error
+import warnings
+warnings.filterwarnings('ignore')
+
+print("="*60)
+print("🚀 THE FINAL MILE: LIGHTGBM + CATBOOST ENSEMBLE")
+print("="*60)
+
+# =============================================================
+# 1. VERIFY DATA IN RAM
+# =============================================================
+if 'train_fe' not in globals() or 'test_fe' not in globals() or 'common_features' not in globals():
+    raise NameError("🚨 Data missing from memory! Please run the Grandmaster CatBoost cell first.")
+
+print("\n[1] DTW Features detected in RAM. Arming LightGBM...")
+
+X_train = train_fe[common_features].copy().fillna(train_fe[common_features].median())
+y_train = train_fe['TVT'].copy()
+groups = train_fe['WELL_ID'].copy()
+
+# =============================================================
+# 2. LIGHTGBM K-FOLD EXECUTION
+# =============================================================
+print("\n[2] Executing LightGBM Cross-Validation...")
+
+n_splits = 5
+gkf = GroupKFold(n_splits=n_splits)
+
+fold_rmse_lgb = []
+oof_lgb = np.zeros(len(X_train))
+
+# High-Precision LGBM Parameters tailored to compliment CatBoost
+lgb_params = {
+    'objective': 'regression',
+    'metric': 'rmse',
+    'learning_rate': 0.02,        # Slow and steady for the final mile
+    'n_estimators': 3500,         # Deep run
+    'num_leaves': 63,             # Allows complex, asymmetric rock mapping
+    'max_depth': 8,
+    'feature_fraction': 0.75,     # Hides 25% of features per tree to force diversity
+    'bagging_fraction': 0.8,
+    'bagging_freq': 1,
+    'min_child_samples': 40,
+    'random_state': 2026,         # Different random seed than CatBoost!
+    'verbose': -1,
+    'n_jobs': -1
+}
+
+models_lgb = []
+
+for fold, (train_idx, val_idx) in enumerate(gkf.split(X_train, y_train, groups)):
+    X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+    y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+    model = lgb.LGBMRegressor(**lgb_params)
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)]
+    )
+
+    val_pred = model.predict(X_val)
+    oof_lgb[val_idx] = val_pred
+
+    rmse = np.sqrt(mean_squared_error(y_val, val_pred))
+    fold_rmse_lgb.append(rmse)
+    print(f"  ✅ LGBM Fold {fold + 1} RMSE: {rmse:.4f} ft")
+
+lgb_overall_rmse = np.sqrt(mean_squared_error(y_train, oof_lgb))
+print(f"\n🏆 LightGBM OOF RMSE: {lgb_overall_rmse:.4f} ft")
+
+# =============================================================
+# 3. ENSEMBLE BLENDING OPTIMIZATION (THE MAGIC TRICK)
+# =============================================================
+print("\n[3] Calculating Optimal Mathematical Blend...")
+
+# oof_predictions is your CatBoost output currently sitting in memory!
+if 'oof_predictions' not in globals():
+    print("⚠️ CatBoost OOF predictions not found. Cannot calculate blend.")
+else:
+    best_blend_rmse = float('inf')
+    best_w = 0.0
+
+    # Test every combination from 0% CatBoost to 100% CatBoost
+    for w in np.linspace(0, 1, 101):
+        blended_preds = (w * oof_predictions) + ((1 - w) * oof_lgb)
+        score = np.sqrt(mean_squared_error(y_train, blended_preds))
+        if score < best_blend_rmse:
+            best_blend_rmse = score
+            best_w = w
+
+    print("\n" + "="*60)
+    print("👑 ULTIMATE BLEND VERDICT 👑")
+    print("="*60)
+    print(f"CatBoost Solo RMSE:       {np.sqrt(mean_squared_error(y_train, oof_predictions)):.4f} ft")
+    print(f"LightGBM Solo RMSE:       {lgb_overall_rmse:.4f} ft")
+    print(f"Optimal Weighting:        {best_w*100:.0f}% CatBoost / {(1-best_w)*100:.0f}% LightGBM")
+    print(f"BLENDED OOF RMSE:         {best_blend_rmse:.4f} ft")
+    print("="*60)
+
+# =============================================================
+# 4. FINAL TEST PREDICTIONS & SUBMISSION
+# =============================================================
+print("\n[4] Generating Final Blended Submission...")
+
+X_test = test_fe[common_features].copy().fillna(test_fe[common_features].median())
+
+# 1. Get LightGBM predictions
+test_pred_lgb = np.zeros(len(X_test))
+for model in models_lgb:
+    test_pred_lgb += model.predict(X_test) / len(models_lgb)
+
+# 2. Get CatBoost predictions (from memory)
+test_pred_cat = test_predictions if 'test_predictions' in globals() else test_pred_lgb # Failsafe
+
+# 3. Apply the optimal mathematical blend
+w = best_w if 'best_w' in locals() else 0.5
+final_blended_test_preds = (w * test_pred_cat) + ((1 - w) * test_pred_lgb)
+
+test_fe['TVT_predicted'] = final_blended_test_preds
+
+# 4. Apply to baseline
+if 'TVT_extrapolated' in test_fe.columns:
+    mask_no_extrap = test_fe['TVT_extrapolated'].isna()
+    test_fe.loc[mask_no_extrap, 'TVT_extrapolated'] = test_fe.loc[mask_no_extrap, 'estimated_TVT_from_Z']
+    blend_weight = test_fe['dist_from_last_known'].clip(0, 1000) / 1000
+    blend_weight = blend_weight.fillna(0.5)
+    test_fe['TVT_final'] = (1 - blend_weight) * test_fe['TVT_extrapolated'] + blend_weight * test_fe['TVT_predicted']
+else:
+    test_fe['TVT_final'] = test_fe['TVT_predicted']
+
+submission_mask = test['TVT_input'].isna()
+submission_df = test[submission_mask][['WELL_ID', 'MD']].copy()
+submission_df = submission_df.merge(test_fe[['WELL_ID', 'MD', 'TVT_final']], on=['WELL_ID', 'MD'], how='left')
+submission_df = submission_df.rename(columns={'TVT_final': 'TVT'})
+
+if submission_df['TVT'].isna().any():
+    submission_df['TVT'] = submission_df['TVT'].fillna(submission_df['TVT'].median())
+
+submission_df = submission_df[['WELL_ID', 'MD', 'TVT']]
+submission_df.to_csv('Tawila_Submission_Ultimate_Blend.csv', index=False)
+print("\n✓ Project secured! Submission saved to 'Tawila_Submission_Ultimate_Blend.csv'")
