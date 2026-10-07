@@ -1,0 +1,532 @@
+# Install libraries
+!pip install PyWavelets dtaidistance --quiet
+#DWT helpful in splitting GR signals in waves that can give useful input
+#DTW very important anchor value
+import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
+import pywt# Discrete Wavelet Transform library
+from scipy.interpolate import interp1d
+from dtaidistance import dtw as dtw_lib
+from pathlib import Path
+from tqdm.notebook import tqdm
+import warnings; warnings.filterwarnings('ignore')
+
+print('Libraries ready.')
+print(f'PyWavelets version: {pywt.__version__}')
+# DWT feature extraction function
+#function takes one well GR signal and returns 4 DWT features
+# For GR signal:
+# Approximation = slow geological trend (low frequency)
+# Detail level 1 = medium scale variations (bed boundaries)
+# Detail level 2 = fine scale variations
+# Detail level 3 = very fine details
+def extract_dwt_features(signal, wavelet='db4', level=3):
+    n = len(signal)
+    coeffs = pywt.wavedec(signal, wavelet, level=level)    # Decompose signal into wavelet coefficients
+    features = {}
+    # separates the smooth trend (approximation) and the fine variaions (details)
+    #interpolating alot but still standard practice so fine and improved error abit when checke in light GBM
+    approx = coeffs[0]
+    features['DWT_approx'] = np.interp(
+        np.linspace(0, 1, n), np.linspace(0, 1, len(approx)), approx
+    )
+    # DWT coefficients are shorter than the Original GR signal as each layer halves the length so we apply interpolation fro the remaining data
+    for i, detail in enumerate(coeffs[1:], 1):
+        features[f'DWT_detail_{i}'] = np.interp(
+            np.linspace(0, 1, n), np.linspace(0, 1, len(detail)), detail
+        )
+    return features
+import pandas as pd
+
+# Load a sample training well to inspect its columns
+train_df = pd.read_csv(TRAIN_DIR / f'{train_ids[0]}_horizontal_well.csv')
+
+# 1. List all column names to find the exact name for the formation/zone
+print("--- All Column Names ---")
+print(train_df.columns.tolist())
+
+# 2. Display the data types and non-null counts
+print("\n--- Column Info ---")
+train_df.info()
+import pandas as pd
+
+# 1. Identify the earliest point in the well (minimum MD) to act as your vertical Type Well reference
+initial_point = train_df.loc[train_df['MD'].idxmin()]
+
+# 2. Extract the true depths of each surface at this initial location
+formations = ['ASTNU', 'ASTNL', 'EGFDU', 'EGFDL', 'BUDA']
+real_tops = {fmt: initial_point[fmt] for fmt in formations}
+
+# 3. Calculate the true geological thickness of each layer
+# Thickness = Depth of the Next Formation Top - Depth of Current Formation Top
+thicknesses = {}
+for i in range(len(formations) - 1):
+    top_name = formations[i]
+    base_name = formations[i+1]
+    thicknesses[top_name] = real_tops[base_name] - real_tops[top_name]
+
+# 4. Print the results cleanly
+print("--- REAL STRATIGRAPHIC TOPS (TVD) ---")
+for fmt, depth in real_tops.items():
+    print(f"{fmt:<12}: {depth:.2f} ft")
+
+print("\n--- TRUE GEOLOGICAL THICKNESS ---")
+for fmt, thick in thicknesses.items():
+    print(f"{fmt:<12}: {thick:.2f} ft")
+print(f"{'BUDA':<12}: (Base unknown in dataset)")
+# Histogram matching function (for DTW_pred)
+#
+# Maps horizontal GR distribution onto typewell GR distribution.
+# Horizontal GR (e.g. 31-217) and typewell GR (e.g. 28-158) come from
+# different logging tools with different calibration ranges.
+# Histogram matching remaps percentile-to-percentile so both signals
+# are comparable for DTW.
+
+def histogram_match(source, reference):
+    percentiles = np.linspace(0, 100, 1000)
+    source_pcts    = np.percentile(source,    percentiles)
+    reference_pcts = np.percentile(reference, percentiles)
+    mapping = interp1d(
+        source_pcts, reference_pcts, kind='linear',
+        bounds_error=False,
+        fill_value=(reference_pcts[0], reference_pcts[-1])
+    )
+    return mapping(source)
+
+print('Histogram matching function ready.')
+def dtw_predict_tvt(hz_gr_matched, tw, bandwidth_pct=0.15):
+    """
+    takes all the below values to return the desired DTW TVT prediction
+    hz_gr_matched : horizontal GR after histogram matching to typewell scale
+    tw            : typewell dataframe, sorted by TVT, with GR and TVT columns
+    bandwidth_pct : Sakoe-Chiba band as fraction of typewell length (fixed,
+                    no DE — literature fallback "manually test 5/10/15/20%")
+    """
+    #need values as numpy
+    tw_gr  = tw['GR'].values.astype(np.double)
+    tw_tvt = tw['TVT'].values
+    hz_gr  = hz_gr_matched.astype(np.double)
+
+    window = max(1, int(bandwidth_pct * len(tw_gr)))
+    path = dtw_lib.warping_path(hz_gr, tw_gr, window=window)#there is a specific python library for this imported in the import cell and used here
+
+    # path = list of (hz_idx, tw_idx) pairs, possibly many-to-one in
+    # either direction. Build sparse (hz_idx -> tvt) pairs, dedupe by
+    # averaging tw_tvt for repeated hz_idx, then interpolate over all
+    # hz rows so every row gets a value (no zeros).
+    pair_dict = {}
+    for hz_idx, tw_idx in path:
+        pair_dict.setdefault(hz_idx, []).append(tw_tvt[tw_idx])
+
+    hz_idxs = np.array(sorted(pair_dict.keys()))
+    hz_vals = np.array([np.mean(pair_dict[i]) for i in hz_idxs])
+
+    all_idx = np.arange(len(hz_gr))
+    tvt_pred = np.interp(all_idx, hz_idxs, hz_vals)
+    return tvt_pred
+
+print('DTW prediction function ready (bug-fixed, no-zeros version).')
+# Main preprocessing function
+# Processes one well and returns a DataFrame with all the features suggested from the literature review.
+
+FORMATION_ORDER = ['ANCC','ASTNU','ASTNL','EGFDU','EGFDL','BUDA']
+
+def preprocess_well(well_id, data_dir):
+    """
+    Process one well and extract all features.
+    """
+    hz = pd.read_csv(data_dir / f'{well_id}_horizontal_well.csv')
+    tw = pd.read_csv(data_dir / f'{well_id}_typewell.csv')
+    # Detect TVT input column — the one that goes NaN at Prediction Start
+    #starts by finding the TVT columns then find the TVT columns that goes NAN after PS(start of the missing values  in TVT)
+    #goes through column by column (just for automation purposes this is used)
+    tvt_cols = [c for c in hz.columns if 'tvt' in c.lower()]
+    tvt_col  = next((c for c in tvt_cols if hz[c].isnull().any()), tvt_cols[0] if tvt_cols else 'TVT')
+
+    # ── Step 1: Fix missing GR ────────────────────────────────────────────
+    # Linear interpolation fills gaps between known values.
+    # ffill/bfill handle edges where interpolation cannot reach.
+    hz['GR'] = hz['GR'].interpolate(method='linear').ffill().bfill()
+
+    # ── Step 2: Normalise GR per well (z-score) ───────────────────────────
+    # Subtract mean and divide by std.
+    # used to put all wells on the same scale
+    mu, sigma = hz['GR'].mean(), hz['GR'].std()
+    hz['GR_norm'] = (hz['GR'] - mu) / sigma if sigma > 0 else 0.0#to avoid any surprises
+
+    # ── Step 3: Find Prediction Start ─────────────────────────────────────
+    # Last row where TVT is known. Beyond this we must predict.
+    ps = hz[tvt_col].last_valid_index()
+    if ps is None: ps = len(hz) - 1#just to avoid potential crash if all TVT are missing not really vital this just wante to cover all grounds
+
+    # ── Step 4: GR derivatives ────────────────────────────────────────────
+    # GR_d1: first derivative — is GR rising or falling?
+    #   Positive = entering shale. Negative = leaving shale.
+    # GR_d2: second derivative — is the rate of change accelerating?
+    #   High = approaching a geological boundary.
+    hz['GR_d1'] = hz['GR_norm'].diff().fillna(0)
+    hz['GR_d2'] = hz['GR_d1'].diff().fillna(0)
+
+    # ── Step 5: GR volatility ─────────────────────────────────────────────
+    # High volatility = may suggest thin beds or transition zone.
+    # Low volatility = suggests stable layer interior.
+    shifted = hz['GR'].shift(1).replace(0, np.nan)
+    #divides current by previous GR reading and then log the result then calcuales the absolute value we only need change by how much
+    hz['GR_vol']       = np.abs(np.log(hz['GR'].replace(0,np.nan)/shifted)).fillna(0)
+    #computes the standard deviation of GR_VOL within each 25 row window (if fewer rows exist then use what is available)
+
+    hz['GR_vol_std25'] = hz['GR_vol'].rolling(25,min_periods=1,center=True).std().fillna(0)
+
+    # ── Step 6: Rolling windows at 4 spatial scales ───────────────────────
+    # Captures geological character at different length scales.
+    # 10 rows = may be local bed character
+    # 100 rows = may be regional formation character
+    for w in [10, 25, 50, 100]:
+        hz[f'GR_mean_{w}'] = hz['GR_norm'].rolling(w,min_periods=1,center=True).mean()
+        hz[f'GR_std_{w}']  = hz['GR_norm'].rolling(w,min_periods=1,center=True).std().fillna(0)
+
+    # ── Step 7: DWT features ──────────────────────────────────────────────
+    # Discrete Wavelet Transform decomposes GR into frequency layers.
+    # Approximation = slow geological trend
+    # Detail levels = progressively finer variations
+    #idea retrieved from competition site
+    #use cell  3 function and adds 4 DWT columns or features
+    dwt_features = extract_dwt_features(hz['GR_norm'].values)
+    for name, values in dwt_features.items():
+        hz[name] = values
+
+    # ── Step 8: Dip from trajectory ───────────────────────────────────────
+    # dZ/dMD: rate of change of vertical depth per unit measured depth.
+    # Positive = drill going deeper (TVT increases).
+    # Negative = drill going upward (TVT decreases).
+    if 'Z' in hz.columns and 'MD' in hz.columns:
+        hz['dZ_dMD'] = (hz['Z'].diff() / hz['MD'].diff().replace(0,np.nan)).fillna(0)
+    else:
+        hz['dZ_dMD'] = 0.0
+
+    # ── Step 9: Formation distances and absolute depths ───────────────────
+    # dist_TOP = distance from current Z to formation top depth.
+    # Zero = drill is exactly at that boundary.
+    # Also store absolute formation top depths as direct features.
+    top_depths = {}
+    for top in FORMATION_ORDER:
+        if top in hz.columns and 'Z' in hz.columns:#only proceeds if those formation columns exists in data in case something was deleted or other wells have something missing
+            top_depth = hz[top].ffill().bfill()#handling missing data by using available forward or backward data (nearest and will be siilar data changes slowly)
+            hz[f'dist_{top}'] = hz['Z'] - top_depth
+            hz[f'abs_{top}']  = top_depth# same formation column but with missing values handled
+            top_depths[top]   = top_depth
+        else:
+            hz[f'dist_{top}'] = 0.0
+            hz[f'abs_{top}']  = 0.0
+            top_depths[top]   = pd.Series(np.nan, index=hz.index)
+
+    # ── Step 10:  formation_zone ──────────────────────────────────────
+    # Which two formation topsbracket the current Z?
+    # zone code = index where drill bit exists i.e
+    #   0 = above ANCC
+    #   1 = between ANCC and ASTNU
+    #   2 = between ASTNU and ASTNL
+    #   ...
+    #   6 = below BUDA
+    # This gives the model a direct "which layer am I in" signal instead
+    # of inferring it from 6 separate dist_TOP columns.
+    top_depth_matrix = pd.DataFrame(top_depths)
+    z_col = hz['Z'] if 'Z' in hz.columns else pd.Series(0.0, index=hz.index)
+    zone = np.zeros(len(hz), dtype=int)
+    valid_tops = [t for t in FORMATION_ORDER if top_depth_matrix[t].notna().all()]
+    if valid_tops:
+        for t in valid_tops:
+            zone += (z_col.values >= top_depth_matrix[t].values).astype(int)
+    hz['formation_zone'] = zone
+
+    # ── Step 11: Calibration window ───────────────────────────────────────
+    # Mean and std of GR in last 500 rows before PS.
+    #stored as a constant for all rows (last rows most releveant according to literature)
+    # Captures what geological character the drill was just inside.
+    cal = hz.loc[max(0,ps-500):ps, 'GR_norm']
+    hz['calib_mean'] = cal.mean() if len(cal) > 0 else 0.0
+    hz['calib_std']  = float(cal.std()) if len(cal) > 1 else 0.0
+
+    # ── Step 12: Anchor features ──────────────────────────────────────────
+        # TVT_last: last known TVT, forward filled. The geological anchor.still vary valuable desspite uncertainity as seen with feature importance in some models
+    # dist_from_PS: feet beyond PS. Uncertainty grows with distance.
+    hz['TVT_last']     = hz[tvt_col].ffill().bfill()
+    hz['dist_from_PS'] = np.maximum(np.array(hz.index) - ps, 0)
+
+    # ── Step 13:  DTW_pred ( DTW alignment) ──────────────────
+    try:
+        tw_s = tw.sort_values('TVT').dropna(subset=['TVT','GR']).reset_index(drop=True)
+        if len(tw_s) > 1:
+            hz_gr_matched = histogram_match(hz['GR'].values, tw_s['GR'].values)
+            hz['DTW_pred'] = dtw_predict_tvt(hz_gr_matched, tw_s, bandwidth_pct=0.15)#calls function
+        else:
+            hz['DTW_pred'] = hz['TVT_last']
+    except Exception:
+        hz['DTW_pred'] = hz['TVT_last']
+
+    # ── Step 14: Geographic coordinates ────────────────────────────────────
+    # Well location. Wells close together share geological patterns.
+    #each well should have very similar coordinates almost identical for all rows which represent the starting point
+    if 'X' in hz.columns:
+        hz['well_X'] = hz['X'].iloc[0]
+        hz['well_Y'] = hz['Y'].iloc[0] if 'Y' in hz.columns else 0.0
+    else:
+        hz['well_X'] = 0.0
+        hz['well_Y'] = 0.0
+
+    # ── Metadata ──────────────────────────────────────────────────────────
+    hz['well_id'] = well_id
+    hz['ps_idx']  = ps
+    #just identifers
+    return hz, ps
+
+
+BASE_FEATURES = [
+    'GR_norm','GR_d1','GR_d2','GR_vol','GR_vol_std25',
+    'GR_mean_10','GR_mean_25','GR_mean_50','GR_mean_100',
+    'GR_std_10','GR_std_25','GR_std_50','GR_std_100',
+    'DWT_approx','DWT_detail_1','DWT_detail_2','DWT_detail_3',
+    'dZ_dMD',
+    'dist_ANCC','dist_ASTNU','dist_ASTNL','dist_EGFDU','dist_EGFDL','dist_BUDA',
+    'abs_ANCC','abs_ASTNU','abs_ASTNL','abs_EGFDU','abs_EGFDL','abs_BUDA',
+    'formation_zone',
+    'calib_mean','calib_std',
+    'TVT_last','dist_from_PS',
+    'DTW_pred',
+    'well_X','well_Y',
+]
+print(f'Preprocessing function ready.')
+print(f'Total features: {len(BASE_FEATURES)}')
+# Test on one well
+#quality/sanity check using a single well
+wid = train_ids[0]
+hz_proc, ps = preprocess_well(wid, TRAIN_DIR)#call function preprocessing
+
+present = [c for c in BASE_FEATURES if c in hz_proc.columns]
+missing = [c for c in BASE_FEATURES if c not in hz_proc.columns]
+
+print(f'Well: {wid}')
+print(f'Rows: {len(hz_proc)} | PS: {ps}')
+print(f'Features computed: {len(present)}/{len(BASE_FEATURES)}')
+if missing: print(f'Missing: {missing}')
+
+nans = hz_proc[present].isnull().sum().sum()
+print(f'NaN check: {"PASS" if nans==0 else f"WARNING: {nans} NaN values"}')
+
+print(f'\nformation_zone sanity check:')
+print(f'  Unique zone values: {sorted(hz_proc["formation_zone"].unique())}')
+print(f'  Zone value counts:\n{hz_proc["formation_zone"].value_counts().sort_index()}')
+
+print(f'\nDTW_pred sanity check:')
+print(f'  DTW_pred range: {hz_proc["DTW_pred"].min():.1f} to {hz_proc["DTW_pred"].max():.1f}')
+print(f'  True TVT range (pre-PS): {hz_proc[hz_proc.index <= ps]["TVT"].min():.1f} to '
+      f'{hz_proc[hz_proc.index <= ps]["TVT"].max():.1f}')
+print(f'  Zeros in DTW_pred: {(hz_proc["DTW_pred"] == 0).sum()}')# Process ALL training wells
+all_train, failed = [], []
+print(f'Processing {len(train_ids)} training wells...')
+#like that progress box of wid very nice
+for wid in tqdm(train_ids):
+    try:
+        df, _ = preprocess_well(wid, TRAIN_DIR)
+        all_train.append(df)
+    except Exception as e:
+        failed.append((wid, str(e)))
+
+print(f'Done. OK: {len(all_train)} | Failed: {len(failed)}')
+if failed:
+    for w,e in failed[:5]: print(f'  {w}: {e}')
+
+train_df = pd.concat(all_train, ignore_index=True)
+print(f'Combined: {len(train_df):,} rows, {train_df["well_id"].nunique()} wells')
+# Process ALL test wells
+all_test, failed_t = [], []
+print(f'Processing {len(test_ids)} test wells...')
+for wid in tqdm(test_ids):
+    try:
+        df, _ = preprocess_well(wid, TEST_DIR)
+        all_test.append(df)
+    except Exception as e:
+        failed_t.append((wid, str(e)))
+print(f'Done. OK: {len(all_test)} | Failed: {len(failed_t)}')
+test_df = pd.concat(all_test, ignore_index=True)
+print(f'Test: {len(test_df):,} rows, {test_df["well_id"].nunique()} wells')
+# Cell 1 — Install and import LightGBM
+!pip install lightgbm --quiet
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy.signal import savgol_filter
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error
+import lightgbm as lgb
+import warnings
+warnings.filterwarnings('ignore')
+
+print(f'LightGBM version: {lgb.__version__}')
+ Cell 3 — Feature columns
+# All features from Notebook
+
+FEATURE_COLS = [
+    'GR_norm','GR_d1','GR_d2','GR_vol','GR_vol_std25',
+    'GR_mean_10','GR_mean_25','GR_mean_50','GR_mean_100',
+    'GR_std_10','GR_std_25','GR_std_50','GR_std_100',
+    'DWT_approx','DWT_detail_1','DWT_detail_2','DWT_detail_3',
+    'dZ_dMD',
+    'dist_ANCC','dist_ASTNU','dist_ASTNL','dist_EGFDU','dist_EGFDL','dist_BUDA',
+    'abs_ANCC','abs_ASTNU','abs_ASTNL','abs_EGFDU','abs_EGFDL','abs_BUDA',
+    'calib_mean','calib_std',
+    'TVT_last','dist_from_PS',
+    'well_X','well_Y', 'formation_zone', 'DTW_pred'
+]
+
+FEATURES = [c for c in FEATURE_COLS if c in train_df.columns]
+print(f'Features available: {len(FEATURES)}')
+print(f'Features: {FEATURES}')
+#tried to drop features based on shap and feature importance but error did not imporve
+#left it to show attempt
+
+#DROP_FEATURES = [
+#'GR_d2', 'GR_d1', 'GR_vol', 'DWT_detail_3',
+#'DWT_detail_2'
+#]
+
+#FEATURES = [f for f in FEATURES if f not in DROP_FEATURES]
+#print(f'Reduced to {len(FEATURES)} features')
+# Cell 4 — Prepare training data
+# I only used rows where TVT is known (before Prediction Start)
+
+train_labeled = train_df[train_df['TVT'].notna()].copy()
+
+X      = train_labeled[FEATURES].fillna(0).values
+y      = train_labeled['TVT'].values
+groups = train_labeled['well_id'].values
+
+print(f'Labeled rows: {len(X):,}')
+print(f'TVT range: {y.min():.1f} to {y.max():.1f} ft')
+# Cell 5 — LightGBM hyperparameters
+#
+# LightGBM key parameters:
+# num_leaves: Max leaves per treecontrols model complexity. Higher = more complex but slower.
+# learning_rate: step size per tree and how much each tree corrects error. Lower = more trees needed but better.
+# n_estimators: number of trees to build.
+# min_child_samples: minimum rows per leaf. Prevents overfitting.
+# feature_fraction: fraction of features per tree. Adds randomness.
+# bagging_fraction: fraction of rows per tree. Adds randomness.
+#subsample: each tree see rows randomly dependong on percentage
+#features changed after optuna or hyper parameter optimization improved from round 12.8 to around 10.6
+
+LGBM_PARAMS = {
+'n_estimators': 1100,
+'num_leaves': 148,
+'learning_rate': 0.04239771850382143,
+'subsample': 0.7463424900725001,
+'colsample_bytree': 0.9835648331027723,
+'reg_alpha': 0.0010487355219207556,#L1 regularization
+'reg_lambda': 0.041310197520935205,#L2 regularization
+'min_child_samples': 50,#probably what improved the result big time to 10.6
+'objective': 'regression',
+'metric': 'rmse',
+'random_state': 42,
+'n_jobs': -1,
+'verbose': -1,
+}
+
+print('LightGBM parameters set.')
+from sklearn.model_selection import GroupKFold
+
+# Cell 6 — GroupKFold cross-validation
+#
+# GroupKFold ensures entire wells are held out per fold (keeps enite wells together).
+# This gives honest RMSE estimates — the model never sees
+#any row from a validation well during training for that fold.
+#5 folds based on research is satandard so chose that
+#so trains on four groups and test on 1 and then repeats
+#calculates the RMSE final out of fold error
+
+kf = GroupKFold(n_splits=5)
+fold_rmses = []
+oof_preds  = np.zeros(len(y))#for storing the final predictions
+
+print('Running 5-fold GroupKFold cross-validation...')
+print()
+
+for fold, (tr_idx, val_idx) in enumerate(kf.split(X, y, groups=groups)):
+    X_tr, X_val = X[tr_idx], X[val_idx]
+    y_tr, y_val = y[tr_idx], y[val_idx]
+
+    model = lgb.LGBMRegressor(**LGBM_PARAMS)
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(False)]#stops training after
+        #Rmse does not improve after 50 consective trees
+    )
+
+    val_preds = model.predict(X_val)
+    oof_preds[val_idx] = val_preds#stores
+    rmse = np.sqrt(mean_squared_error(y_val, val_preds))
+    fold_rmses.append(rmse)
+    print(f'Fold {fold+1}: RMSE = {rmse:.4f} ft  |  Best iteration: {model.best_iteration_}')
+
+oof_rmse = np.sqrt(mean_squared_error(y, oof_preds))
+np.save('/content/drive/MyDrive/borehole prediction Capstone /Other work/oof_preds.npy', oof_preds)#actual predicted values on TRAINING DATA for correlation test to check ensemble method
+print('LightGBM OOF saved')
+print(f'\nOverall OOF RMSE: {oof_rmse:.4f} ft')
+# Cell 7 — Feature importance
+# Shows which features LightGBM used most in tree splits.
+# DWT features and TVT_last  dominate.
+
+importance = model.feature_importances_
+feat_imp = pd.DataFrame({'feature':FEATURES,'importance':importance}).sort_values('importance',ascending=False)
+print('Top 15 features:')
+print(feat_imp.head(15).to_string(index=False))
+
+plt.figure(figsize=(10,6))
+plt.barh(feat_imp['feature'].head(15)[::-1], feat_imp['importance'].head(15)[::-1], color='steelblue')
+plt.xlabel('Importance')
+plt.title('LightGBM Feature Importance (Top 15)')
+plt.tight_layout()
+plt.show()
+# Cell 8 — Train final model on all data and predict test wells
+#trains on all data
+#previous group K Fold cell told me how good model is and saved predicted values for all training wells
+#to do correlation test with other models for the ensemble and compare with true result
+print('Training final model on all labeled data...')
+final_model = lgb.LGBMRegressor(**LGBM_PARAMS)
+final_model.fit(X, y, callbacks=[lgb.log_evaluation(False)])
+
+# Detect prediction rows (null values)
+tvt_cols  = [c for c in test_df.columns if 'tvt' in c.lower()]
+TVT_INPUT = next((c for c in tvt_cols if test_df[c].isnull().any()), tvt_cols[0])
+
+results = []
+for wid in test_df['well_id'].unique():
+    well      = test_df[test_df['well_id'] == wid]
+    pred_mask = well[TVT_INPUT].isnull()
+    pred_rows = well[pred_mask]
+
+    if len(pred_rows) == 0:
+        continue
+
+    X_test = pred_rows[FEATURES].fillna(0).values
+    preds  = final_model.predict(X_test)
+
+    # Apply Savitzky-Golay smoothing applied to the test well predictions
+    # to avoid physically impossible jumps as TVT cannot change 10 feet in one foot of drilling we apply this smoothing method.
+    # Savitzky-Golay fits a polynomial through each window of predictions
+    # and removes these impossible jumps while preserving real transitions.
+    if len(preds) >= 11:
+        preds = savgol_filter(preds, 11, 2)
+    elif len(preds) >= 5:
+        preds = savgol_filter(preds, 5, 2)
+
+    for idx, pred in zip(pred_rows.index, preds):
+        results.append({'well_id': wid, 'row_idx': idx, 'TVT_pred': pred})
+
+results_df = pd.DataFrame(results)
+results_df.to_csv(OUTPUT_DIR / 'lgbm_predictions.csv', index=False)
+print(f'Predictions saved: {len(results_df):,} rows')
+print(f'OOF RMSE: {oof_rmse:.4f} ft')
+
+print('DWT feature function ready.')
