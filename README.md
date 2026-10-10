@@ -312,15 +312,7 @@ Saved model artifacts should be packaged with the preprocessing rules, feature o
 
 ---
 
-## 11. References
 
-- **Dataset:** Kaggle Eagle Ford benchmark dataset.
-- **Project repository:** https://github.com/shimaaelemam2012-cloud/Geosteering-in-horizontal-wells
-- Ke, G., et al. (2017). *LightGBM: A Highly Efficient Gradient Boosting Decision Tree.*
-- Prokhorenkova, L., et al. (2018). *CatBoost: Unbiased Boosting with Categorical Features.*
-- Akiba, T., et al. (2019). *Optuna: A Next-generation Hyperparameter Optimization Framework.*
-
----
 
 ## Summary
 
