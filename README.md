@@ -1,4 +1,4 @@
-# Geosteering-in-horizontal-wells
+
 # Hybrid Machine Learning for Horizontal-Well Geosteering
 
 A hybrid machine-learning workflow for predicting formation boundaries and supporting horizontal-well geosteering using the Eagle Ford benchmark dataset.
